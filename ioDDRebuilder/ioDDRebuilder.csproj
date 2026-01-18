@@ -20,7 +20,7 @@
     <Nullable>enable</Nullable>
 
     <!-- Ikon + exe navn -->
-    <ApplicationIcon>pictures\ioDD_REBUILDER.ico</ApplicationIcon>
+    <ApplicationIcon>..\ioDD_REBUILDER_256x256.ico</ApplicationIcon>
     <AssemblyName>ioDDRebuilder</AssemblyName>
 
     <!-- (valgfrit) -->
