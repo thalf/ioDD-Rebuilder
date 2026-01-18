@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>IODDRebuilder.Formatter</AssemblyName>
+    <RootNamespace>IODDRebuilder.Formatter</RootNamespace>
+    <ApplicationIcon>ioDD_Rebuilder.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Deterministic>false</Deterministic>
+  </PropertyGroup>
+
+</Project>
+
