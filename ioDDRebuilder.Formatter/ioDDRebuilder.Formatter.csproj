@@ -1,17 +1,16 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
+    <OutputType>Exe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>IODDRebuilder.Formatter</AssemblyName>
     <RootNamespace>IODDRebuilder.Formatter</RootNamespace>
-    <ApplicationIcon>ioDD_Rebuilder.ico</ApplicationIcon>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\ioDD_REBUILDER_256x256.ico</ApplicationIcon>
+
     <Deterministic>false</Deterministic>
   </PropertyGroup>
 
-</Project>
-
+<ItemGroup><Compile Include="../Shared/FormatSafety.cs" Link="FormatSafety.cs" /></ItemGroup></Project>

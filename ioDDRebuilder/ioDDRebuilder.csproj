@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <!-- Identitet / detaljer -->
@@ -27,5 +27,4 @@
     <Deterministic>false</Deterministic>
   </PropertyGroup>
 
-</Project>
-
+<ItemGroup><Compile Include="../Shared/FormatSafety.cs" Link="FormatSafety.cs" /></ItemGroup></Project>

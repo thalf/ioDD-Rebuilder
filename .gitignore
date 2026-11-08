@@ -421,3 +421,5 @@ FodyWeavers.xsd
 *.zip
 DIST_ioDDRebuilder_win-x64/
 
+
+docs/images/format-script-for-parser.ps1

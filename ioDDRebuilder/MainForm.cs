@@ -1,4 +1,4 @@
-﻿// iODD Rebuilder
+// iODD Rebuilder
 // - ALWAYS rebuild: Confirm -> format destination -> full sequential copy (contiguous best effort)
 // - No admin by default; UAC only for formatting PowerShell
 // - Progress is REAL bytes copied (not file length reservation)
@@ -100,7 +100,7 @@ namespace ioDDRebuilder
             catch (Exception ex) { SafeLog($"[UI] Icon loading failed: {ex.Message}"); /* Icon loading failed, continue without */ }
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.Sizable;
-            MinimumSize = new Size(1000, 740);
+            MinimumSize = new Size(1000, 800);
             Font = new Font("Segoe UI", 10f);
             BackColor = Color.FromArgb(250, 250, 250);
 
@@ -329,7 +329,7 @@ namespace ioDDRebuilder
                 Text = "Stats",
                 Dock = DockStyle.Top,
                 Padding = new Padding(16),
-                Height = 235
+                Height = 260
             };
 
             var stats = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 6 };
@@ -386,7 +386,10 @@ namespace ioDDRebuilder
 
             btnStart.Click += async (_, __) => { SafeLog("[UI] START button clicked"); await StartCopyAsync(); };
             btnCancel.Click += (_, __) => { SafeLog("[UI] Cancel button clicked"); CancelCopy(); };
-            FormClosing += (_, __) => CancelCopy();
+            FormClosing += (_, e) =>
+            {
+                if (_cts != null) { e.Cancel = true; CancelCopy(); }
+            };
 
             bottom.Controls.Add(btnStart);
             bottom.Controls.Add(btnCancel);
@@ -523,8 +526,8 @@ namespace ioDDRebuilder
         private void CancelCopy()
         {
             try { _cts?.Cancel(); } catch { }
-            SetRunning(false);
-            SafeLog("[UI] Copy operation cancelled by user");
+            btnCancel.Enabled = false;
+            SafeLog("[UI] Cancellation requested; waiting for worker to stop");
             statusLeft.Text = "Cancelled";
         }
 
@@ -553,6 +556,25 @@ Please select a valid source folder by clicking on the dropdown.");
             
             SafeLog($"[START] Destination selected: {di.Root} ({di.Label})");
 
+            FileInfo[] files;
+            long totalBytes;
+            FormatSafety.Target target;
+            string fileSystem = cmbFs.SelectedItem?.ToString() ?? "";
+            try
+            {
+                FormatSafety.CheckSource(src, di.Root);
+                files = FormatSafety.Scan(src)
+                    .Where(f => !ExcludeNames.Contains(f.Name, StringComparer.OrdinalIgnoreCase))
+                    .OrderByDescending(f => IsBig(f.Extension)).ThenByDescending(f => f.Length).ToArray();
+                target = FormatSafety.Inspect(di.Root, src);
+                FormatSafety.CheckFiles(files, target.Size, fileSystem);
+                totalBytes = files.Sum(f => f.Length);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Preflight failed; nothing was erased.\n" + ex.Message);
+                return;
+            }
             // Confirm + format
             var destLetter = di.Root.Trim().TrimEnd('\\').TrimEnd(':'); // "F"
             using (var dlg = new ConfirmFormatDialog(di.Root, di.Label))
@@ -570,30 +592,21 @@ Please select a valid source folder by clicking on the dropdown.");
                 SafeLog($"FORMAT START: {di.Root} Label={di.Label}");
                 SafeLog($"DEBUG: destLetter={destLetter}, calling FormatDriveLetter...");
 
-                // UAC only here
-                var fsSel = (cmbFs?.SelectedItem?.ToString() ?? "exFAT").Trim();
-                // Normalize casing for different tools
-                string fileSystem = fsSel.Equals("exfat", StringComparison.OrdinalIgnoreCase) ? "exFAT" :
-                                    fsSel.Equals("fat32", StringComparison.OrdinalIgnoreCase) ? "FAT32" :
-                                    "NTFS".Equals(fsSel, StringComparison.OrdinalIgnoreCase) ? "NTFS" : "exFAT";
-
-                // Optional advisory: FAT32 has 32GB format limits on Windows
-                try
-                {
-                    var diDest = new DriveInfo(di.Root);
-                    if (fileSystem == "FAT32" && diDest.TotalSize > (long)32 * 1024 * 1024 * 1024)
-                        SafeLog("[WARN] FAT32 chosen on volume >32GB; Windows tools may limit formatting. Using best-effort.");
-                }
-                catch { }
-
-                FormatDriveLetter(destLetter, fileSystem: fileSystem, newLabel: "IODD");
-
+                // Recheck after confirmation and again inside the elevated process.
+                FormatSafety.CheckSource(src, di.Root);
+                var currentFiles = FormatSafety.Scan(src)
+                    .Where(f => !ExcludeNames.Contains(f.Name, StringComparer.OrdinalIgnoreCase))
+                    .OrderByDescending(f => IsBig(f.Extension)).ThenByDescending(f => f.Length).ToArray();
+                if (!files.Select(f => (f.FullName, f.Length)).SequenceEqual(
+                    currentFiles.Select(f => (f.FullName, f.Length))))
+                    throw new InvalidOperationException("Source changed; start again.");
+                FormatSafety.CheckFiles(files, target.Size, fileSystem);
+                FormatSafety.Format(di.Root, src, target, fileSystem);
                 SafeLog("FORMAT DONE");
                 PopulateDrives();
                 ReselectDrive(destLetter);
 
-                // Ensure destination is empty after format (belt-and-braces cleanup)
-                CleanDestination(di.Root);
+                // No recursive deletion: a failed format must never trigger cleanup.
             }
             catch (Exception ex)
             {
@@ -602,50 +615,6 @@ Please select a valid source folder by clicking on the dropdown.");
                 SafeLog($"STACK TRACE: {ex.StackTrace}");
                 MessageBox.Show("Format fejl:\n" + ex.Message + "\n\nSe log: " + _logPath);
                 statusLeft.Text = "Format failed";
-                return;
-            }
-
-            // Scan
-            FileInfo[] files;
-            long totalBytes;
-
-            try
-            {
-                SafeLog($"[SCAN] Starting file enumeration from {src}");
-                var allFiles = Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories).ToList();
-                SafeLog($"[SCAN] Found {allFiles.Count} total files before filtering");
-
-                files = allFiles
-                    .Select(p => new FileInfo(p))
-                    .Where(f => !ExcludeNames.Contains(f.Name, StringComparer.OrdinalIgnoreCase))
-                    // Big first (best for contiguous)
-                    .OrderByDescending(f => IsBig(f.Extension))
-                    .ThenByDescending(f => f.Length)
-                    .ToArray();
-
-                totalBytes = files.Sum(f => f.Length);
-
-                SafeLog($"[SCAN] After filtering: {files.Length} files, {totalBytes} bytes");
-                SafeLog($"===== START {DateTime.Now:dd/MM/yyyy HH.mm.ss} =====");
-                SafeLog($"Source: {src}");
-                SafeLog($"Dest:   {di.Root}");
-                SafeLog($"Files:  {files.Length}");
-                SafeLog($"Bytes:  {totalBytes}");
-                SafeLog("");
-            }
-            catch (Exception ex)
-            {
-                SetRunning(false);
-                SafeLog($"[SCAN] FAILED: {ex.GetType().Name}: {ex.Message}");
-                SafeLog($"[SCAN] STACK: {ex.StackTrace}");
-                MessageBox.Show("Fejl under scanning:\n" + ex.Message);
-                return;
-            }
-
-            if (files.Length == 0)
-            {
-                SetRunning(false);
-                MessageBox.Show("Ingen filer at kopiere.");
                 return;
             }
 
@@ -703,6 +672,8 @@ Please select a valid source folder by clicking on the dropdown.");
             }
             finally
             {
+                _cts?.Dispose();
+                _cts = null;
                 SetRunning(false);
             }
         }
@@ -773,7 +744,7 @@ Please select a valid source folder by clicking on the dropdown.");
                 using var src = new FileStream(f.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
                     bufSize, FileOptions.SequentialScan);
 
-                using var dstFs = new FileStream(dst, FileMode.Create, FileAccess.Write, FileShare.None,
+                using var dstFs = new FileStream(dst, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                     bufSize, FileOptions.SequentialScan);
 
                 int read;
@@ -872,248 +843,6 @@ Please select a valid source folder by clicking on the dropdown.");
             int i = 0;
             while (b >= 1024 && i < suf.Length - 1) { b /= 1024; i++; }
             return $"{b:0.0} {suf[i]}";
-        }
-
-        private void FormatDriveLetter(string driveLetter, string fileSystem, string newLabel)
-        {
-            driveLetter = driveLetter.Trim().TrimEnd(':').ToUpperInvariant();
-            string driveRoot = $"{driveLetter}:";
-
-            SafeLog($"[FORMAT_DEBUG] Function called with drive={driveRoot}");
-
-            try
-            {
-                // Run format with explicit path via PowerShell Start-Process -Verb RunAs, then verify label
-                var formatPath = Path.Combine(Environment.SystemDirectory, "format.com");
-                var formatArgs = $"{driveRoot} /FS:{fileSystem} /V:{newLabel} /Q /Y";
-
-                // PowerShell command: Start-Process -FilePath 'format.com' -ArgumentList 'F: /FS:exFAT /V:IODD /Q /Y' -Verb RunAs -Wait
-                string psCommand = $"Start-Process -FilePath '\"{formatPath}\"' -ArgumentList '\"{formatArgs}\"' -Verb RunAs -Wait";
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "powershell.exe",
-                    Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{psCommand}\"",
-                    UseShellExecute = true,   // needed for Verb RunAs inside PS
-                    Verb = "runas",
-                    CreateNoWindow = false
-                };
-
-                SafeLog($"[FORMAT_DEBUG] FileName: {psi.FileName}");
-                SafeLog($"[FORMAT_DEBUG] Arguments: {psi.Arguments}");
-
-                SafeLog($"[FORMAT_DEBUG] Starting process...");
-                var p = Process.Start(psi);
-                SafeLog($"[FORMAT_DEBUG] Process.Start returned: {(p == null ? "NULL" : "OK (ID=" + p.Id + ")")}");
-
-                if (p != null)
-                {
-                    SafeLog($"[FORMAT_DEBUG] Waiting for process to exit...");
-                    p.WaitForExit();
-                    SafeLog($"[FORMAT_DEBUG] Process exited.");
-                    p.Dispose();
-                }
-                else
-                {
-                    SafeLog($"[FORMAT_DEBUG] WARNING: Process.Start returned null");
-                }
-
-                // Verify label to ensure format actually happened
-                SafeLog($"[FORMAT_DEBUG] Verifying volume label...");
-                bool ok = false;
-                for (int i = 0; i < 8; i++)
-                {
-                    try
-                    {
-                        var di = new DriveInfo(driveRoot);
-                        SafeLog($"[FORMAT_DEBUG] Verification attempt {i+1}: IsReady={di.IsReady}, Label='{di.VolumeLabel}'");
-                        if (di.IsReady && string.Equals(di.VolumeLabel, newLabel, StringComparison.OrdinalIgnoreCase))
-                        {
-                            SafeLog($"[FORMAT_DEBUG] ✓ Label verified successfully!");
-                            ok = true;
-                            break;
-                        }
-                    }
-                    catch (Exception ex) 
-                    { 
-                        SafeLog($"[FORMAT_DEBUG] Verification attempt {i+1} failed: {ex.Message}");
-                    }
-                    Thread.Sleep(1000);
-                }
-
-                if (!ok)
-                {
-                    SafeLog($"[FORMAT_DEBUG] Primary format verification failed; attempting DiskPart fallback...");
-                    RunDiskPartFormat(driveLetter, fileSystem, newLabel);
-
-                    // Re-verify after DiskPart
-                    ok = false;
-                    for (int i = 0; i < 10; i++)
-                    {
-                        try
-                        {
-                            var di2 = new DriveInfo(driveRoot);
-                            if (di2.IsReady && string.Equals(di2.VolumeLabel, newLabel, StringComparison.OrdinalIgnoreCase))
-                            {
-                                ok = true;
-                                break;
-                            }
-                        }
-                        catch (Exception ex) 
-                        { 
-                            SafeLog($"[FORMAT_DEBUG] Label verification attempt {i+1} failed: {ex.Message}");
-                        }
-                        Thread.Sleep(1000);
-                    }
-
-                    if (!ok)
-                        throw new Exception($"Format verification failed after DiskPart: volume label is not '{newLabel}'.");
-                }
-
-                SafeLog($"[FORMAT_DEBUG] Format verified: label={newLabel}");
-            }
-            catch (System.ComponentModel.Win32Exception ex)
-            {
-                SafeLog($"[FORMAT_DEBUG] Win32Exception: {ex.Message} (Code: {ex.ErrorCode})");
-                throw;
-            }
-            catch (Exception ex)
-            {
-                SafeLog($"[FORMAT_DEBUG] Exception: {ex.GetType().Name}: {ex.Message}");
-                throw;
-            }
-        }
-
-        // DiskPart fallback: select volume by drive letter and format
-        private void RunDiskPartFormat(string driveLetter, string fileSystem, string newLabel)
-        {
-            SafeLog($"[DISKPART] Starting fallback format for {driveLetter}:");
-            string scriptPath = Path.Combine(Path.GetTempPath(), $"iodd_diskpart_{driveLetter}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-            string diskpartScript = string.Join(Environment.NewLine, new[]
-            {
-                $"select volume {driveLetter}",
-                $"format fs={fileSystem} label={newLabel} quick",
-                $"assign letter={driveLetter}",
-                "exit"
-            });
-
-            File.WriteAllText(scriptPath, diskpartScript);
-            SafeLog($"[DISKPART] Script: {scriptPath}\n{diskpartScript}");
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"Start-Process -FilePath 'diskpart.exe' -ArgumentList '/s \"{scriptPath}\"' -Verb RunAs -Wait\"",
-                UseShellExecute = true,
-                Verb = "runas",
-                CreateNoWindow = false
-            };
-
-            var p = Process.Start(psi);
-            if (p != null)
-            {
-                SafeLog($"[DISKPART] DiskPart process started (ID={p.Id})");
-                p.WaitForExit();
-                SafeLog($"[DISKPART] DiskPart process exited with code: {p.ExitCode}");
-            }
-            else
-            {
-                SafeLog($"[DISKPART] WARNING: Process.Start returned null");
-            }
-
-            try { File.Delete(scriptPath); } 
-            catch (Exception ex) { SafeLog($"[DISKPART] Could not delete script {scriptPath}: {ex.Message}"); }
-            SafeLog("[DISKPART] Fallback format completed.");
-        }
-
-        // Strong reset via PowerShell storage cmdlets (Clear-Disk, Initialize-Disk, New-Partition, Format-Volume)
-        private void RunStrongResetPowerShell(string driveLetter, string fileSystem, string newLabel)
-        {
-            SafeLog($"[STRONG_RESET] Starting strong reset for {driveLetter}: FS={fileSystem}, Label={newLabel}");
-            // PowerShell script: resolve disk from drive letter and recreate
-            string ps = $@"
-$dl = '{driveLetter}'
-$part = Get-Partition -DriveLetter $dl -ErrorAction Stop
-$disk = Get-Disk -Number $part.DiskNumber -ErrorAction Stop
-Clear-Disk -Number $disk.Number -RemoveData -Confirm:$false
-Initialize-Disk -Number $disk.Number -PartitionStyle GPT
-$newPart = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
-Set-Partition -DiskNumber $disk.Number -PartitionNumber $newPart.PartitionNumber -NewDriveLetter $dl
-Format-Volume -DriveLetter $dl -FileSystem {fileSystem} -NewFileSystemLabel {newLabel} -Confirm:$false
-";
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{ps.Replace("\"", "\\\"")}\"",
-                UseShellExecute = true,
-                Verb = "runas",
-                CreateNoWindow = false
-            };
-
-            var p = Process.Start(psi);
-            if (p == null)
-            {
-                SafeLog("[STRONG_RESET] FAILED: Process.Start returned null");
-                throw new Exception("Failed to start PowerShell for strong reset");
-            }
-            SafeLog($"[STRONG_RESET] Process started (ID={p.Id}), waiting for exit...");
-            p.WaitForExit();
-            SafeLog($"[STRONG_RESET] Process exited with code: {p.ExitCode}");
-            if (p.ExitCode != 0)
-                throw new Exception($"Strong reset failed (exit code {p.ExitCode})");
-        }
-
-        // Remove any existing files/folders from destination root after format
-        private void CleanDestination(string root)
-        {
-            SafeLog($"[CLEAN] Removing existing files in {root}");
-            try
-            {
-                var di = new DirectoryInfo(root);
-                if (!di.Exists)
-                {
-                    SafeLog($"[CLEAN] Path not found: {root}");
-                    return;
-                }
-
-                // Delete files
-                foreach (var file in di.GetFiles())
-                {
-                    try
-                    {
-                        file.Attributes = FileAttributes.Normal;
-                        file.Delete();
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeLog($"[CLEAN] File delete failed {file.FullName}: {ex.Message}");
-                        throw;
-                    }
-                }
-
-                // Delete directories
-                foreach (var dir in di.GetDirectories())
-                {
-                    try
-                    {
-                        dir.Attributes = FileAttributes.Normal;
-                        dir.Delete(true);
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeLog($"[CLEAN] Dir delete failed {dir.FullName}: {ex.Message}");
-                        throw;
-                    }
-                }
-
-                SafeLog("[CLEAN] Destination is empty");
-            }
-            catch (Exception ex)
-            {
-                SafeLog($"[CLEAN] Exception: {ex.Message}");
-                throw;
-            }
         }
 
         private readonly record struct DriveItem(string Text, string Root, string Label);
@@ -1228,4 +957,3 @@ Format-Volume -DriveLetter $dl -FileSystem {fileSystem} -NewFileSystemLabel {new
         }
     }
 }
-
