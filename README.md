@@ -8,6 +8,10 @@ Built for large ISO/IMG/VHD/VHDX workflows where copying big files first can imp
 
 ---
 
+<img width="491" height="365" alt="image" src="https://github.com/user-attachments/assets/135e1207-2825-4d9d-bb9b-334fb45a0bed" />
+
+---
+
 ## Features
 
 - No admin by default (UAC only during formatting)
