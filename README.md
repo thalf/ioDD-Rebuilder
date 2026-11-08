@@ -9,7 +9,7 @@ Large disk images (`.iso`, `.img`, `.vhd`, `.vhdx`) are copied first, largest fi
 > Back up both your image library and anything on the destination before starting. Verify the drive letter and label yourself. Cancellation cannot undo formatting and can leave an incomplete library. This is not a recovery or backup tool.
 
 > [!WARNING]
-> The safeguards described below are source changes awaiting review. The existing **v1.0.0 release does not include them**. Do not use that older binary to evaluate these protections. No new release is published by this change.
+> The safeguards described below apply to source builds. The existing **v1.0.0 release does not include them**. Do not use that older binary to evaluate these protections. No new release is published by this change.
 
 ## Screenshots
 
@@ -45,7 +45,7 @@ This revision accepts only writable **USB-connected** destination disks with an 
 7. Wait for formatting and copying to finish. **Cancel** requests a stop during copying; controls remain locked until the worker stops. Formatting itself cannot be cancelled from the GUI.
 8. Use **Log** to inspect `%TEMP%\iodd_rebuilder_*.log`. Check copied files and test the image library on your iODD before deleting your source backup.
 
-Destination disk/volume identity is checked again inside the elevated process immediately before formatting. A formatting error stops the rebuild: there is no DiskPart retry, whole-disk reset, or recursive cleanup fallback. These checks reduce accidental erasure risk; they cannot protect against hardware faults or devices being changed during the operation.
+The confirmation dialog shows the freshly inspected label and capacity. Destination disk/volume identity is checked again inside the elevated process immediately before formatting, and once more before copying. All copy writes use the confirmed volume GUID path instead of its drive letter, so reassignment of that letter cannot redirect the copy to another volume. A formatting error stops the rebuild: there is no DiskPart retry, whole-disk reset, or recursive cleanup fallback. These checks reduce accidental erasure risk; they cannot protect against hardware faults or devices being changed during the operation.
 
 Folders are recreated, then files are copied sequentially. `Thumbs.db`, `desktop.ini`, and legacy `iodd_push*` helper/log filenames listed in the source code are excluded. File metadata, ACLs, and cryptographic verification are not preserved/performed.
 
@@ -60,7 +60,7 @@ dotnet run --project tests/SafetyTests.csproj -c Release -- docs/images
 ./tests/Test-StorageGuard.ps1
 ```
 
-Tests exercise input rejection, source scanning, filesystem/capacity checks, and elevated guard generation without executing formatting. Source-link tests require Windows Developer Mode or permission to create symbolic links. CI also parses the generated PowerShell syntax and runs 13 mocked storage scenarios (system/source disks, read-only/offline/internal disks, changed identities, and command failures). Hardware formatting, UAC cancellation, unplug/replug, and iODD compatibility still require manual validation on a backed-up disposable USB device before release.
+Tests exercise input rejection, source scanning, filesystem/capacity checks, and elevated guard generation without executing formatting. Source-link tests require Windows Developer Mode or permission to create symbolic links. CI also parses the generated PowerShell syntax and runs 14 mocked storage scenarios (system/source disks, read-only/offline/internal disks, changed identities, and command failures). Hardware formatting, UAC cancellation, unplug/replug, and iODD compatibility still require manual validation on a backed-up disposable USB device before release.
 
 Optional framework-dependent Windows x64 publish:
 
@@ -77,4 +77,3 @@ The separate `ioDDRebuilder.Formatter` console helper is for maintainers. It req
 ## License
 
 [MIT](LICENSE).
-

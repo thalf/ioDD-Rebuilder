@@ -559,6 +559,7 @@ Please select a valid source folder by clicking on the dropdown.");
             FileInfo[] files;
             long totalBytes;
             FormatSafety.Target target;
+            string copyRoot;
             string fileSystem = cmbFs.SelectedItem?.ToString() ?? "";
             try
             {
@@ -577,7 +578,7 @@ Please select a valid source folder by clicking on the dropdown.");
             }
             // Confirm + format
             var destLetter = di.Root.Trim().TrimEnd('\\').TrimEnd(':'); // "F"
-            using (var dlg = new ConfirmFormatDialog(di.Root, di.Label))
+            using (var dlg = new ConfirmFormatDialog(di.Root, target.Label, target.Size))
             {
                 if (dlg.ShowDialog(this) != DialogResult.OK)
                     return;
@@ -589,8 +590,8 @@ Please select a valid source folder by clicking on the dropdown.");
                 statusLeft.Text = "Formatting drive...";
                 lblCurrentRel.Text = $"Formatting {di.Root} ...";
                 bar.Value = 0;
-                SafeLog($"FORMAT START: {di.Root} Label={di.Label}");
-                SafeLog($"DEBUG: destLetter={destLetter}, calling FormatDriveLetter...");
+                SafeLog($"FORMAT START: {di.Root} Label={target.Label}");
+                SafeLog($"[FORMAT] Validated volume: {target.VolumePath}, disk: {target.DiskId}");
 
                 // Recheck after confirmation and again inside the elevated process.
                 FormatSafety.CheckSource(src, di.Root);
@@ -602,6 +603,8 @@ Please select a valid source folder by clicking on the dropdown.");
                     throw new InvalidOperationException("Source changed; start again.");
                 FormatSafety.CheckFiles(files, target.Size, fileSystem);
                 FormatSafety.Format(di.Root, src, target, fileSystem);
+                // Revalidate the formatted target, then abandon the drive letter for all writes.
+                copyRoot = FormatSafety.CopyRoot(target, FormatSafety.Inspect(di.Root, src));
                 SafeLog("FORMAT DONE");
                 PopulateDrives();
                 ReselectDrive(destLetter);
@@ -638,7 +641,7 @@ Please select a valid source folder by clicking on the dropdown.");
 
             try
             {
-                await Task.Run(() => CopySequentialWithProgress(src, di.Root, files, totalBytes, _cts.Token));
+                await Task.Run(() => CopySequentialWithProgress(src, copyRoot, files, totalBytes, _cts.Token));
 
                 BeginInvoke(new Action(() =>
                 {
@@ -697,6 +700,7 @@ Please select a valid source folder by clicking on the dropdown.");
 
         private void CopySequentialWithProgress(string srcRoot, string destRoot, FileInfo[] files, long totalBytes, CancellationToken token)
         {
+            FormatSafety.ValidateVolumePath(destRoot);
             long doneBytes = 0;
 
             // Pre-create dirs
@@ -849,7 +853,7 @@ Please select a valid source folder by clicking on the dropdown.");
 
         private sealed class ConfirmFormatDialog : Form
         {
-            public ConfirmFormatDialog(string drive, string label)
+            public ConfirmFormatDialog(string drive, string label, long size = 0)
             {
                 Text = "Confirm FORMAT";
                 StartPosition = FormStartPosition.CenterParent;
@@ -892,7 +896,8 @@ Please select a valid source folder by clicking on the dropdown.");
                     "This will DELETE ALL data on the destination drive.\n" +
                     "This action CANNOT be undone.\n\n" +
                     $"Drive: {drive}\n" +
-                    $"Label: {label}";
+                    $"Label: {label}\n" +
+                    (size > 0 ? $"Size: {FormatBytes(size)}" : "");
 
                 // Make "ADVARSEL" stand out by coloring the first line via simple trick:
                 // (we keep it simple: bold + red in a separate label)

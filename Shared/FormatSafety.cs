@@ -2,12 +2,35 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 
+
 namespace ioDDRebuilder;
 
 // Shared by both entry points. Unknown/ambiguous storage topology is rejected.
 internal static class FormatSafety
 {
-    internal sealed record Target(string DiskId, string VolumeId, long Size);
+    internal sealed record Target(string DiskId, string VolumeId, long Size,
+        string Label = "", string VolumePath = "");
+
+    internal static void ValidateVolumePath(string path)
+    {
+        const string prefix = @"\\?\Volume{";
+        if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+            !path.EndsWith(@"}\", StringComparison.Ordinal) ||
+            !Guid.TryParseExact(path[prefix.Length..^2], "D", out _))
+            throw new InvalidOperationException("Cannot pin destination to a volume GUID path.");
+    }
+
+    internal static string CopyRoot(Target expected, Target current)
+    {
+        ValidateVolumePath(expected.VolumePath);
+        ValidateVolumePath(current.VolumePath);
+        if (!string.Equals(expected.DiskId, current.DiskId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(expected.VolumeId, current.VolumeId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(expected.VolumePath, current.VolumePath, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Destination changed after formatting. Copy stopped.");
+        // Every write uses this volume path, never a reassigned drive letter.
+        return expected.VolumePath;
+    }
     internal static string Letter(string root)
     {
         if (root.Length != 3 || root[1] != ':' || root[2] != '\\' ||
@@ -90,17 +113,21 @@ if ($d.IsBoot -or $d.IsSystem -or $d.IsOffline -or $d.IsReadOnly -or
     internal static Target Inspect(string destination, string source)
     {
         var json = Run(GuardScript(destination, source) + "\n" + """
-[pscustomobject]@{ DiskId = [string]$d.UniqueId; VolumeId = [string]$v.UniqueId; Size = [long]$v.Size } | ConvertTo-Json -Compress
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[pscustomobject]@{ DiskId = [string]$d.UniqueId; VolumeId = [string]$v.UniqueId; Size = [long]$v.Size; Label = [string]$v.FileSystemLabel; VolumePath = [string]$v.Path } | ConvertTo-Json -Compress
 """, false);
-        return JsonSerializer.Deserialize<Target>(json.Trim()) ??
+        var target = JsonSerializer.Deserialize<Target>(json.Trim()) ??
             throw new InvalidOperationException("Cannot identify destination.");
+        ValidateVolumePath(target.VolumePath);
+        return target;
     }
 
     internal static string BuildFormatScript(string destination, string source, Target expected, string fs)
     {
         if (fs is not ("exFAT" or "NTFS" or "FAT32")) throw new InvalidOperationException("Unsupported filesystem.");
+        ValidateVolumePath(expected.VolumePath);
         return GuardScript(destination, source) + "\n" + $$"""
-if ($d.UniqueId -ne {{Quote(expected.DiskId)}} -or $v.UniqueId -ne {{Quote(expected.VolumeId)}} -or $v.Size -ne {{expected.Size}}) {
+if ($d.UniqueId -ne {{Quote(expected.DiskId)}} -or $v.UniqueId -ne {{Quote(expected.VolumeId)}} -or $v.Size -ne {{expected.Size}} -or $v.Path -ne {{Quote(expected.VolumePath)}}) {
     throw 'Destination changed since confirmation'
 }
 $v | Format-Volume -FileSystem {{fs}} -NewFileSystemLabel IODD -Confirm:$false -Force -ErrorAction Stop | Out-Null
@@ -136,5 +163,3 @@ if ($after.FileSystem -ne '{{fs}}' -or $after.FileSystemLabel -ne 'IODD') { thro
         return output?.GetAwaiter().GetResult() ?? "";
     }
 }
-
-
