@@ -1,0 +1,21 @@
+name: Safety checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  safety:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet build ioDDRebuilder/ioDDRebuilder.csproj -c Release
+      - run: dotnet build ioDDRebuilder.Formatter/ioDDRebuilder.Formatter.csproj -c Release
+      - run: dotnet run --project tests/SafetyTests.csproj -c Release -- docs/images
+      - shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$pwd/docs/images/format-script-for-parser.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors.Count) { throw ($errors | Out-String) }
+      - run: ./tests/Test-StorageGuard.ps1
