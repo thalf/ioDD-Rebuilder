@@ -8,9 +8,9 @@
     <Description>ioDD Rebuilder</Description>
 
     <!-- Versions -->
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
 
     <!-- App / build -->
     <OutputType>WinExe</OutputType>
@@ -24,7 +24,9 @@
     <AssemblyName>ioDDRebuilder</AssemblyName>
 
     <!-- (valgfrit) -->
-    <Deterministic>false</Deterministic>
+    <Deterministic>true</Deterministic>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 
-<ItemGroup><Compile Include="../Shared/FormatSafety.cs" Link="FormatSafety.cs" /></ItemGroup></Project>
+<ItemGroup><EmbeddedResource Include="../ioDD_REBUILDER_256x256.ico" LogicalName="ioDDRebuilder.App.ico" /></ItemGroup>
+<ItemGroup><Compile Include="../Shared/FormatSafety.cs" Link="FormatSafety.cs" /></ItemGroup><ItemGroup><Compile Include="../Shared/FileVerification.cs" Link="FileVerification.cs" /></ItemGroup></Project>

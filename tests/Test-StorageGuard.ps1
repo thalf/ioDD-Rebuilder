@@ -6,6 +6,7 @@ function Get-Partition {
     $number = switch ($DriveLetter) { F { 2 } D { 3 } default { 0 } }
     if ($global:ioddTestScenario -eq 'source-disk' -and $DriveLetter -eq 'D') { $number = 2 }
     if ($global:ioddTestScenario -eq 'windows-disk' -and $DriveLetter -eq 'C') { $number = 2 }
+    if ($global:ioddTestScenario -eq 'ambiguous' -and $DriveLetter -eq 'F') { [pscustomobject]@{ DiskNumber = 9 } }
     [pscustomobject]@{ DiskNumber = $number }
 }
 function Get-Disk {
@@ -13,7 +14,7 @@ function Get-Disk {
     if ($global:ioddTestScenario -eq 'query-failure') { throw 'Storage unavailable' }
     [pscustomobject]@{
         Number = $Number
-        UniqueId = $(if ($global:ioddTestScenario -eq 'changed-disk') { 'different' } else { "disk'id" })
+        UniqueId = $(if ($global:ioddTestScenario -eq 'missing-identity') { '' } elseif ($global:ioddTestScenario -eq 'changed-disk') { 'different' } else { "disk'id" })
         IsBoot = $global:ioddTestScenario -eq 'boot'
         IsSystem = $global:ioddTestScenario -eq 'system'
         IsReadOnly = $global:ioddTestScenario -eq 'read-only'
@@ -44,7 +45,7 @@ function Format-Volume {
 $oldSystemDrive = $env:SystemDrive
 try {
     $env:SystemDrive = 'C:'
-    foreach ($global:ioddTestScenario in @('boot','system','windows-disk','source-disk','read-only','offline','internal','changed-disk','changed-volume','changed-size','changed-path','query-failure','format-failure','valid')) {
+    foreach ($global:ioddTestScenario in @('ambiguous','missing-identity','boot','system','windows-disk','source-disk','read-only','offline','internal','changed-disk','changed-volume','changed-size','changed-path','query-failure','format-failure','valid')) {
         $global:ioddTestFormatted = $false
         $failed = $false
         try { & $ScriptPath } catch { $failed = $true }
@@ -54,5 +55,5 @@ try {
             if (!$failed) { throw 'Format error not propagated' }
         } elseif (!$failed -or $global:ioddTestFormatted) { throw "Unsafe target accepted: $global:ioddTestScenario" }
     }
-    Write-Host 'PASS: 14 mocked storage scenarios; no real storage cmdlets executed.'
+    Write-Host 'PASS: 16 mocked storage scenarios; no real storage cmdlets executed.'
 } finally { $env:SystemDrive = $oldSystemDrive }

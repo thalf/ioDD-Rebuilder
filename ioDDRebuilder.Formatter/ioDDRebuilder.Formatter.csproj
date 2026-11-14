@@ -2,6 +2,9 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -10,7 +13,8 @@
     <RootNamespace>IODDRebuilder.Formatter</RootNamespace>
     <ApplicationIcon>..\ioDD_REBUILDER_256x256.ico</ApplicationIcon>
 
-    <Deterministic>false</Deterministic>
+    <Deterministic>true</Deterministic>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 
 <ItemGroup><Compile Include="../Shared/FormatSafety.cs" Link="FormatSafety.cs" /></ItemGroup></Project>

@@ -16,6 +16,12 @@ internal static class Tests
     static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+        using (var iconStream = typeof(MainForm).Assembly.GetManifestResourceStream("ioDDRebuilder.App.ico") ?? throw new Exception("Missing managed icon"))
+        using (var icon = new Icon(iconStream))
+        {
+            foreach (int size in new[] { 16, 32, 48, 64, 128, 256 })
+            { using var selected = new Icon(icon, size, size); using var bitmap = selected.ToBitmap(); if (bitmap.Width != size) throw new Exception("Invalid icon size"); passed++; }
+        }
         foreach (var bad in new[] { "", "C:", @"C:\folder", @"\\server\share", "é:\\", "F;Remove-Item" })
             Reject(() => FormatSafety.Letter(bad));
         if (FormatSafety.Letter(@"f:\") != "F") throw new Exception("Normalization");
@@ -52,6 +58,11 @@ internal static class Tests
         {
             IEnumerable<Control> Descendants(Control parent) =>
                 parent.Controls.Cast<Control>().SelectMany(child => new[] { child }.Concat(Descendants(child)));
+            var erase = Descendants(dialog).OfType<Button>().Single(button => button.Text == "FORMAT DISK");
+            if (erase.Enabled || dialog.AcceptButton == erase || dialog.CancelButton == erase) throw new Exception("Unsafe confirmation default");
+            Descendants(dialog).OfType<CheckBox>().Single().Checked = true;
+            if (!erase.Enabled) throw new Exception("Acknowledgment did not enable confirmation");
+            passed++;
             var body = Descendants(dialog).Select(control => control.Text);
             if (!body.Any(text => text.Contains("Label: CURRENT USB") && text.Contains("Size:")))
                 throw new Exception("Confirmation must show inspected label and capacity.");
@@ -75,6 +86,20 @@ internal static class Tests
         try
         {
             File.WriteAllText(Path.Combine(temp, "image.iso"), "test");
+            var original = Path.Combine(temp, "image.iso");
+            var copy = Path.Combine(temp, "copy.iso");
+            File.Copy(original, copy);
+            FileVerification.Verify(original, copy, CancellationToken.None); passed++;
+            File.WriteAllText(copy, "different");
+            try { FileVerification.Verify(original, copy, CancellationToken.None); throw new Exception("Mismatch accepted"); }
+            catch (IOException) { passed++; }
+            using (var cancelled = new CancellationTokenSource())
+            {
+                cancelled.Cancel();
+                try { FileVerification.Verify(original, original, cancelled.Token); throw new Exception("Cancellation ignored"); }
+                catch (OperationCanceledException) { passed++; }
+            }
+            File.Delete(copy);
             var files = FormatSafety.Scan(temp);
             if (files.Length != 1) throw new Exception("Scan");
             FormatSafety.CheckFiles(files, 1024L * 1024 * 1024, "exFAT"); passed++;
@@ -90,7 +115,7 @@ internal static class Tests
             var script = FormatSafety.BuildFormatScript(@"F:\", @"D:\images",
                 new FormatSafety.Target("disk'id", "volume'id", 1024, "CURRENT USB", @"\\?\Volume{11111111-1111-1111-1111-111111111111}\"), "exFAT");
             if (!script.Contains("'disk''id'") || !script.Contains("$d.IsBoot") ||
-                !script.Contains("$d.IsSystem") || !script.Contains("$system.DiskNumber") ||
+                !script.Contains("$d.IsSystem") || !script.Contains("$system[0].DiskNumber") ||
                 !script.Contains("$s[0].DiskNumber") || !script.Contains("$d.BusType") ||
                 script.IndexOf("Destination changed") > script.IndexOf("| Format-Volume") ||
                 script.Contains("Clear-Disk") || script.Contains("diskpart"))

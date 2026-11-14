@@ -49,6 +49,11 @@ internal static class FormatSafety
         Letter(root); // UNC paths are deliberately unsupported.
         if (root.Equals(destination, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Source and destination must be on different disks.");
+        CheckSourcePath(full);
+    }
+
+    internal static void CheckSourcePath(string full)
+    {
         for (var dir = new DirectoryInfo(full); dir != null; dir = dir.Parent)
             if ((dir.Attributes & FileAttributes.ReparsePoint) != 0)
                 throw new InvalidOperationException("Source paths cannot contain links or mounted folders.");
@@ -93,16 +98,21 @@ internal static class FormatSafety
     {
         var dl = Letter(destination);
         var sl = Letter(Path.GetPathRoot(Path.GetFullPath(source))!);
+        var al = Letter(Path.GetPathRoot(AppContext.BaseDirectory)!);
         return $$"""
 $ErrorActionPreference = 'Stop'
 $p = @(Get-Partition -DriveLetter '{{dl}}' -ErrorAction Stop)
 $s = @(Get-Partition -DriveLetter '{{sl}}' -ErrorAction Stop)
 if ($p.Count -ne 1 -or $s.Count -ne 1) { throw 'Ambiguous partition mapping' }
+$a = @(Get-Partition -DriveLetter '{{al}}' -ErrorAction Stop)
+if ($a.Count -ne 1) { throw 'Ambiguous application disk mapping' }
 $d = Get-Disk -Number $p[0].DiskNumber -ErrorAction Stop
 $v = Get-Volume -DriveLetter '{{dl}}' -ErrorAction Stop
-$system = Get-Partition -DriveLetter $env:SystemDrive.Substring(0,1) -ErrorAction Stop
+$system = @(Get-Partition -DriveLetter $env:SystemDrive.Substring(0,1) -ErrorAction Stop)
+if (@($d).Count -ne 1 -or @($v).Count -ne 1 -or $system.Count -ne 1) { throw 'Ambiguous storage mapping' }
 if ($d.IsBoot -or $d.IsSystem -or $d.IsOffline -or $d.IsReadOnly -or
-    $d.Number -eq $system.DiskNumber -or $d.Number -eq $s[0].DiskNumber -or
+    $d.Number -eq $system[0].DiskNumber -or $d.Number -eq $s[0].DiskNumber -or
+    $d.Number -eq $a[0].DiskNumber -or
     $d.BusType -ne 'USB' -or $v.DriveType -notin @('Fixed','Removable') -or
     [string]::IsNullOrWhiteSpace($d.UniqueId) -or [string]::IsNullOrWhiteSpace($v.UniqueId)) {
     throw 'Destination must be a writable USB disk separate from Windows and source'
