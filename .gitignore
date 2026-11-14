@@ -423,3 +423,6 @@ DIST_ioDDRebuilder_win-x64/
 
 
 docs/images/format-script-for-parser.ps1
+
+# Local candidate staging and archive verification
+/artifacts/

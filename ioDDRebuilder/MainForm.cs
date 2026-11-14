@@ -1,964 +1,319 @@
-// iODD Rebuilder
-// - ALWAYS rebuild: Confirm -> format destination -> full sequential copy (contiguous best effort)
-// - No admin by default; UAC only for formatting PowerShell
-// - Progress is REAL bytes copied (not file length reservation)
-// - Shows BOTH: file-based % (nice â€œ2%â€) + byte-based % (real data)
-// - Fixes label wrap (Destination) + removes "FORMAT +" text
-
-using System;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 
-namespace ioDDRebuilder
+namespace ioDDRebuilder;
+
+internal static class Program
 {
-    internal static class Program
+    [STAThread]
+    static void Main()
     {
-        [STAThread]
-        static void Main()
+        ApplicationConfiguration.Initialize();
+        Application.Run(new MainForm());
+    }
+}
+
+public sealed class MainForm : Form
+{
+    private readonly TextBox source = new() { Dock = DockStyle.Fill, ReadOnly = true, PlaceholderText = "Choose a local source folder" };
+    private readonly ComboBox destination = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList, DisplayMember = "Text" };
+    private readonly ComboBox filesystem = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly CheckBox verify = new() { Text = "Verify copied files with SHA-256", AutoSize = true };
+    private readonly Button browse = MakeButton("Browse…"), refresh = MakeButton("Refresh drives"), start = MakeButton("Review rebuild"), cancel = MakeButton("Cancel");
+    private readonly Label phase = MakeLabel("Ready"), detail = MakeLabel("Select a source folder and USB destination."), summary = MakeLabel("No files scanned yet.");
+    private readonly Label overall = MakeLabel("—"), current = MakeLabel("—"), speed = MakeLabel("—"), eta = MakeLabel("—");
+    private readonly ProgressBar progress = new() { Dock = DockStyle.Fill, Height = 24 };
+    private readonly ProgressBar fileProgress = new() { Dock = DockStyle.Fill, Height = 20 };
+    private readonly string logPath = Path.Combine(Path.GetTempPath(), $"iodd_rebuilder_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}.log");
+    private bool running;
+    private CancellationTokenSource? cancellation;
+    private readonly object logLock = new();
+    private static readonly string[] ExcludeNames = ["Thumbs.db", "desktop.ini", "iodd_push.ps1", "iodd_push_gui.ps1", "iodd_push_gui.bat", "iodd_push_to_drive.bat", "iodd_push_log.txt"];
+
+    public MainForm()
+    {
+        Text = "iODD Rebuilder • 1.1";
+        Font = new Font("Segoe UI", 10);
+        AutoScaleDimensions = new SizeF(96, 96);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        ClientSize = new Size(1040, 820);
+        MinimumSize = new Size(740, 640);
+        StartPosition = FormStartPosition.CenterScreen;
+        BackColor = Color.FromArgb(246, 248, 251);
+        using (var stream = typeof(MainForm).Assembly.GetManifestResourceStream("ioDDRebuilder.App.ico")
+            ?? throw new InvalidOperationException("Embedded application icon is missing."))
+        using (var embedded = new Icon(stream)) Icon = (Icon)embedded.Clone();
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), ColumnCount = 1, AutoScroll = true };
+        Controls.Add(layout);
+        var title = MakeLabel("Rebuild your iODD library");
+        title.Font = new Font(Font.FontFamily, 22, FontStyle.Bold);
+        Add(layout, title);
+        Add(layout, MakeLabel("Validate → review → format → copy. All destination data will be erased."));
+        var settings = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 3, Padding = new Padding(0, 16, 0, 16) };
+        settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145));
+        settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145));
+        void Row(string text, Control value, Control? action = null)
         {
-            ApplicationConfiguration.Initialize();
-            Application.Run(new MainForm());
+            int row = settings.RowCount++;
+            settings.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            settings.Controls.Add(MakeLabel(text), 0, row);
+            settings.Controls.Add(value, 1, row);
+            if (action != null) settings.Controls.Add(action, 2, row);
+            else settings.SetColumnSpan(value, 2);
+        }
+        Row("Source", source, browse);
+        Row("Destination", destination, refresh);
+        filesystem.Items.AddRange(["exFAT", "NTFS", "FAT32"]);
+        filesystem.SelectedIndex = 0;
+        Row("Format as", filesystem);
+        Row("Read-only check", verify);
+        Add(layout, settings);
+        Add(layout, MakeLabel("Only writable USB disks separate from Windows and the source can pass validation."));
+        Add(layout, summary);
+        phase.Font = new Font(Font.FontFamily, 14, FontStyle.Bold);
+        phase.ForeColor = Color.FromArgb(24, 80, 130);
+        Add(layout, phase);
+        detail.AutoEllipsis = true;
+        Add(layout, detail);
+        Add(layout, progress);
+        Add(layout, overall);
+        Add(layout, fileProgress);
+        Add(layout, current);
+        Add(layout, speed);
+        Add(layout, eta);
+        var actions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top, Padding = new Padding(0, 12, 0, 0), WrapContents = true };
+        var openLog = MakeButton("Open log");
+        var export = MakeButton("Export log…");
+        actions.Controls.AddRange([start, cancel, openLog, export]);
+        Add(layout, actions);
+        cancel.Enabled = false;
+        browse.Click += (_, _) => { using var dialog = new FolderBrowserDialog { Description = "Select source library", ShowNewFolderButton = false }; if (dialog.ShowDialog(this) == DialogResult.OK) { source.Text = dialog.SelectedPath; summary.Text = "Click Review rebuild to scan files and check capacity."; } };
+        refresh.Click += async (_, _) => await PopulateDrivesAsync();
+        start.Click += async (_, _) => await StartCopyAsync();
+        cancel.Click += (_, _) => RequestCancel();
+        openLog.Click += (_, _) => LogAction(() => { SafeLog("Log opened"); Process.Start(new ProcessStartInfo("notepad.exe") { ArgumentList = { logPath }, UseShellExecute = true }); });
+        export.Click += (_, _) => LogAction(() => { using var dialog = new SaveFileDialog { Filter = "Log files|*.log", FileName = Path.GetFileName(logPath) }; if (dialog.ShowDialog(this) == DialogResult.OK) { SafeLog("Log exported"); File.Copy(logPath, dialog.FileName, true); } });
+        FormClosing += (_, e) => { if (running) { e.Cancel = true; if (cancellation != null) RequestCancel(); } };
+        Shown += async (_, _) => { await PopulateDrivesAsync(); layout.ScrollControlIntoView(title); };
+        SafeLog("Application started. No operation starts automatically.");
+    }
+
+    private static Button MakeButton(string text) => new() { Text = text, AutoSize = true, MinimumSize = new Size(120, 36), Margin = new Padding(4), UseVisualStyleBackColor = true };
+    private static Label MakeLabel(string text) => new() { Text = text, AutoSize = true, Dock = DockStyle.Top, Margin = new Padding(4, 7, 4, 7) };
+    private static void Add(TableLayoutPanel parent, Control control) { parent.RowStyles.Add(new RowStyle(SizeType.AutoSize)); parent.Controls.Add(control, 0, parent.RowCount++); }
+    private void SetRunning(bool value)
+    {
+        running = value;
+        foreach (var control in new Control[] { browse, refresh, start, source, destination, filesystem, verify }) control.Enabled = !value;
+        cancel.Enabled = value && cancellation != null;
+    }
+    private void SetPhase(string text, bool indeterminate = false) { phase.Text = text; progress.Style = indeterminate ? ProgressBarStyle.Marquee : ProgressBarStyle.Continuous; SafeLog(text); }
+    private void RequestCancel() { cancellation?.Cancel(); cancel.Enabled = false; phase.Text = "Stopping — waiting for the current I/O to return…"; }
+    private void LogAction(Action action) { try { action(); } catch (Exception ex) { MessageBox.Show(this, ex.Message, "Log could not be opened or exported"); } }
+
+    private sealed record DriveItem(string Text, string Root);
+    private async Task PopulateDrivesAsync()
+    {
+        if (running) return;
+        SetRunning(true);
+        SetPhase("Finding drives…", true);
+        try
+        {
+            var items = await Task.Run(() => DriveInfo.GetDrives().Select(d =>
+            {
+                try { return d.IsReady && d.DriveType is DriveType.Fixed or DriveType.Removable
+                    ? new DriveItem($"{d.Name}  {d.VolumeLabel}  •  {FormatBytes(d.TotalSize)}  •  {d.DriveFormat}", d.Name) : null; }
+                catch (IOException) { return null; }
+                catch (UnauthorizedAccessException) { return null; }
+            }).Where(d => d != null).ToArray());
+            destination.Items.Clear();
+            destination.Items.Add(new DriveItem("Select a drive — USB eligibility is checked before confirmation", ""));
+            foreach (var item in items) destination.Items.Add(item!);
+            destination.SelectedIndex = 0;
+            SetPhase("Ready");
+        }
+        catch (Exception ex) { SetPhase("Drive discovery failed"); detail.Text = ex.Message; SafeLog(ex.ToString()); }
+        finally { progress.Style = ProgressBarStyle.Continuous; SetRunning(false); }
+    }
+
+    private static FileInfo[] Scan(string path) => FormatSafety.Scan(path)
+        .Where(f => !ExcludeNames.Contains(f.Name, StringComparer.OrdinalIgnoreCase))
+        .OrderByDescending(f => f.Extension.ToLowerInvariant() is ".iso" or ".img" or ".vhd" or ".vhdx").ThenByDescending(f => f.Length).ThenBy(f => f.FullName, StringComparer.OrdinalIgnoreCase).ToArray();
+
+    private async Task StartCopyAsync()
+    {
+        if (running) return;
+        if (!Directory.Exists(source.Text) || destination.SelectedItem is not DriveItem drive || drive.Root.Length == 0)
+        { MessageBox.Show(this, "Choose an existing source folder and a USB destination.", "Selection required"); return; }
+        string src = source.Text, fs = filesystem.Text;
+        bool check = verify.Checked, formatAttempted = false;
+        SetRunning(true);
+        var elapsed = Stopwatch.StartNew();
+        try
+        {
+            SetPhase("Scanning and validating…", true);
+            var preview = await Task.Run(() =>
+            {
+                FormatSafety.CheckSource(src, drive.Root);
+                var files = Scan(src);
+                var target = FormatSafety.Inspect(drive.Root, src);
+                FormatSafety.CheckFiles(files, target.Size, fs);
+                return (Files: files, Target: target, Bytes: files.Sum(f => f.Length), Snapshot: files.Select(f => (f.FullName, f.Length, f.LastWriteTimeUtc)).ToArray());
+            });
+            summary.Text = $"{preview.Files.Length:N0} files • {FormatBytes(preview.Bytes)} source • {FormatBytes(preview.Target.Size)} destination";
+            SetPhase("Ready for review");
+            using var dialog = new ConfirmFormatDialog(drive.Root, preview.Target.Label, preview.Target.Size);
+            dialog.Icon = Icon;
+            dialog.AddPreview($"Copy {preview.Files.Length:N0} files ({FormatBytes(preview.Bytes)}) from:\n{src}\nFormat as {fs}, label IODD. SHA-256 verification: {(check ? "enabled" : "disabled")}.");
+            if (dialog.ShowDialog(this) != DialogResult.OK) { SetPhase("Cancelled — nothing erased"); return; }
+            SetPhase("Revalidating source…", true);
+            await Task.Run(() =>
+            {
+                FormatSafety.CheckSource(src, drive.Root);
+                var currentFiles = Scan(src);
+                if (!preview.Snapshot.SequenceEqual(currentFiles.Select(f => (f.FullName, f.Length, f.LastWriteTimeUtc))))
+                    throw new InvalidOperationException("Source changed since review. Start again.");
+                FormatSafety.CheckFiles(currentFiles, preview.Target.Size, fs);
+            });
+            SetPhase("Formatting — wait for completion; this phase cannot be cancelled", true);
+            formatAttempted = true;
+            var root = await Task.Run(() =>
+            {
+                FormatSafety.Format(drive.Root, src, preview.Target, fs);
+                return FormatSafety.CopyRoot(preview.Target, FormatSafety.Inspect(drive.Root, src));
+            });
+            cancellation = new CancellationTokenSource();
+            cancel.Enabled = true;
+            progress.Value = 0;
+            SetPhase("Copying");
+            await Task.Run(() => CopySequentialWithProgress(src, root, preview.Files, preview.Bytes, cancellation.Token));
+            if (check)
+            {
+                SetPhase("Verifying SHA-256 checksums…", true);
+                await Task.Run(() => VerifyCopies(src, root, preview.Files, cancellation.Token));
+            }
+            cancellation.Token.ThrowIfCancellationRequested();
+            progress.Value = fileProgress.Value = 100;
+            SetPhase("Completed");
+            detail.Text = $"Copied {preview.Files.Length:N0} files ({FormatBytes(preview.Bytes)}) in {elapsed.Elapsed:g}. " + (check ? "All checksums matched." : "Verification was not selected.");
+            eta.Text = "Remaining: 00:00:00";
+            SafeLog(detail.Text);
+        }
+        catch (OperationCanceledException) { SetPhase("Cancelled"); detail.Text = "Destination contains an incomplete library. Keep your source and rebuild again."; }
+        catch (Exception ex)
+        {
+            SetPhase("Failed"); SafeLog(ex.ToString());
+            detail.Text = formatAttempted ? "Destination may be erased or incomplete. Keep your source. See the log for details." : "Validation stopped the rebuild. Nothing was erased.";
+            MessageBox.Show(this, detail.Text + "\n\n" + ex.Message + "\n\nLog: " + logPath, "Rebuild stopped", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally { cancellation?.Dispose(); cancellation = null; progress.Style = ProgressBarStyle.Continuous; SetRunning(false); }
+    }
+
+    private void CopySequentialWithProgress(string srcRoot, string destRoot, FileInfo[] files, long totalBytes, CancellationToken token)
+    {
+        FormatSafety.ValidateVolumePath(destRoot);
+        // Re-scan rejects links before any directory is recreated. Never recursively follow new links.
+        FormatSafety.Scan(srcRoot);
+        foreach (var directory in Directory.EnumerateDirectories(srcRoot, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint, IgnoreInaccessible = false }))
+        { token.ThrowIfCancellationRequested(); Directory.CreateDirectory(Path.Combine(destRoot, Path.GetRelativePath(srcRoot, directory))); }
+        long done = 0;
+        var watch = Stopwatch.StartNew();
+        var throttle = Stopwatch.StartNew();
+        byte[] buffer = new byte[1024 * 1024];
+        for (int i = 0; i < files.Length; i++)
+        {
+            token.ThrowIfCancellationRequested();
+            var file = files[i];
+            var relative = Path.GetRelativePath(srcRoot, file.FullName);
+            var output = Path.Combine(destRoot, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+            long copied = 0;
+            int number = i + 1;
+            FormatSafety.CheckSourcePath(Path.GetDirectoryName(file.FullName)!);
+            if ((File.GetAttributes(file.FullName) & FileAttributes.ReparsePoint) != 0) throw new IOException("Source became a link: " + relative);
+            using var input = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read, buffer.Length, FileOptions.SequentialScan);
+            if (input.Length != file.Length) throw new IOException("Source changed: " + relative);
+            using var writer = new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None, buffer.Length, FileOptions.SequentialScan);
+            void Report()
+            {
+                long bytes = done + copied, fileBytes = copied;
+                double bps = bytes / Math.Max(0.001, watch.Elapsed.TotalSeconds);
+                var remaining = bps > 0 ? TimeSpan.FromSeconds(Math.Min(TimeSpan.MaxValue.TotalSeconds - 1, Math.Max(0, totalBytes - bytes) / bps)).ToString(@"dd\.hh\:mm\:ss") : "estimating…";
+                BeginInvoke(new Action(() =>
+                {
+                    progress.Value = totalBytes > 0 ? Math.Clamp((int)(100.0 * bytes / totalBytes), 0, 100) : 100;
+                    fileProgress.Value = file.Length > 0 ? Math.Clamp((int)(100.0 * fileBytes / file.Length), 0, 100) : 100;
+                    detail.Text = relative;
+                    overall.Text = $"Overall: {progress.Value}% • {FormatBytes(bytes)} / {FormatBytes(totalBytes)} • file {number:N0} / {files.Length:N0}";
+                    current.Text = $"Current file: {fileProgress.Value}% • {FormatBytes(fileBytes)} / {FormatBytes(file.Length)}";
+                    speed.Text = $"Average transfer speed: {FormatBytes((long)bps)}/s";
+                    eta.Text = "Estimated remaining: " + remaining;
+                }));
+            }
+            int read;
+            while ((read = input.Read(buffer)) > 0)
+            {
+                token.ThrowIfCancellationRequested();
+                writer.Write(buffer, 0, read); copied += read;
+                if (throttle.ElapsedMilliseconds >= 200) { Report(); throttle.Restart(); }
+            }
+            writer.Flush(true);
+            if (copied != file.Length) throw new IOException("Source changed while copying: " + relative);
+            Report(); done += copied;
+            SafeLog($"Copied {relative}: {copied} bytes");
         }
     }
 
-    public sealed class MainForm : Form
+    private void VerifyCopies(string srcRoot, string destRoot, FileInfo[] files, CancellationToken token)
     {
-        // UI
-        private ComboBox cmbSource = null!;
-        private ComboBox cmbDest = null!;
-        private ComboBox cmbFs = null!; // Filesystem selector
-        private string selectedSourcePath = "";  // Store selected source path
-        private Button btnRefresh = null!;
-        private Button btnOpenLog = null!;
-        private Button btnStart = null!;
-        private Button btnCancel = null!;
-
-        private ProgressBar bar = null!;
-        private Label lblCurrentRel = null!;
-
-        private Label lblOverallFiles = null!;
-        private Label lblOverallBytes = null!;
-        private Label lblFile = null!;
-        private Label lblCurrentFile = null!;
-        private Label lblSpeed = null!;
-        private Label lblEta = null!;
-
-        private StatusStrip status = null!;
-        private ToolStripStatusLabel statusLeft = null!;
-        private ToolStripStatusLabel statusRight = null!;
-
-        // Worker
-        private CancellationTokenSource? _cts;
-
-        // Log
-        private readonly string _logPath;
-
-        // Speed smoothing
-        private double _emaBps = 0;
-        private long _lastOverallBytes = 0;
-        private readonly Stopwatch _tick = new();
-
-        private static readonly string[] ExcludeNames =
+        FormatSafety.ValidateVolumePath(destRoot);
+        foreach (var file in files)
         {
-            "Thumbs.db","desktop.ini",
-            "iodd_push.ps1", "iodd_push_gui.ps1", "iodd_push_gui.bat", "iodd_push_to_drive.bat",
-            "iodd_push_log.txt"
-        };
-
-        public MainForm()
-        {
-            _logPath = Path.Combine(Path.GetTempPath(), $"iodd_rebuilder_{DateTime.Now:yyyyMMdd_HHmmss}.log");
-            BuildUi();
-            PopulateDrives();
-            SetIdleUi();
-            
-            // Set placeholder colors when form loads
-            Load += (_, __) =>
-            {
-                if (cmbSource.SelectedIndex == 0 && cmbSource.Items[0]?.ToString() == "Select source folder...")
-                    cmbSource.ForeColor = Color.FromArgb(150, 150, 150);
-                if (cmbDest.SelectedIndex == 0)
-                    cmbDest.ForeColor = Color.FromArgb(150, 150, 150);
-            };
+            token.ThrowIfCancellationRequested();
+            var relative = Path.GetRelativePath(srcRoot, file.FullName);
+            BeginInvoke(new Action(() => detail.Text = "Verifying: " + relative));
+            FileVerification.Verify(file.FullName, Path.Combine(destRoot, relative), token);
+            SafeLog("Verified " + relative);
         }
+    }
+    private void SafeLog(string message) { lock (logLock) { try { File.AppendAllText(logPath, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}"); } catch (IOException) { Debug.WriteLine(message); } catch (UnauthorizedAccessException) { Debug.WriteLine(message); } } }
+    private static string FormatBytes(long bytes)
+    {
+        double value = bytes; string[] units = ["B", "KiB", "MiB", "GiB", "TiB"]; int index = 0;
+        while (value >= 1024 && index < units.Length - 1) { value /= 1024; index++; }
+        return $"{value:0.0} {units[index]}";
+    }
 
-        private void BuildUi()
+    private sealed class ConfirmFormatDialog : Form
+    {
+        private readonly Label preview = MakeLabel("");
+        public void AddPreview(string text) => preview.Text = text;
+        public ConfirmFormatDialog(string drive, string label, long size = 0)
         {
-            Text = "iODD Rebuilder";
-            try
-            {
-                // Extract icon from embedded EXE icon (set in .csproj ApplicationIcon)
-                var exeIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-                if (exeIcon != null)
-                    Icon = exeIcon;
-            }
-            catch (Exception ex) { SafeLog($"[UI] Icon loading failed: {ex.Message}"); /* Icon loading failed, continue without */ }
-            StartPosition = FormStartPosition.CenterScreen;
-            FormBorderStyle = FormBorderStyle.Sizable;
-            MinimumSize = new Size(1000, 800);
-            Font = new Font("Segoe UI", 10f);
-            BackColor = Color.FromArgb(250, 250, 250);
-
-            var root = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                Padding = new Padding(16),
-                ColumnCount = 1,
-                RowCount = 5,
-                AutoScroll = true
-            };
-            root.RowStyles.Clear();
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Settings
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Progress
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 20));      // Spacer
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Stats
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Buttons
-            Controls.Add(root);
-
-            // ===== SETTINGS =====
-            var gbSettings = new GroupBox
-            {
-                Text = "Settings",
-                Dock = DockStyle.Top,
-                Padding = new Padding(16),
-                Height = 180
-            };
-
-            var settings = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 4,
-                RowCount = 3
-            };
-
-            // FIX: Column 0 wider so "Destination" doesn't wrap to "n" line
-            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 135)); // was 110
-            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
-            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
-
-            settings.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-            settings.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-            settings.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-
-            Label MakeLeft(string t) => new Label
-            {
-                Text = t,
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleLeft,
-                AutoSize = false,
-                Font = new Font("Segoe UI", 10f, FontStyle.Regular),
-                ForeColor = Color.Black
-            };
-
-            // Source
-            settings.Controls.Add(MakeLeft("Source"), 0, 0);
-            cmbSource = new ComboBox 
-            { 
-                Dock = DockStyle.Fill,
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.White,
-                ForeColor = Color.FromArgb(150, 150, 150),
-                TabIndex = 1,
-                Font = new Font("Segoe UI", 10f)
-            };
-            cmbSource.Items.Add("Select source folder...");
-            cmbSource.Items.Add("Browse...");
-            cmbSource.SelectedIndex = 0;
-            cmbSource.DropDown += (_, __) =>
-            {
-                // When dropdown opens, set to black so all items are readable
-                cmbSource.ForeColor = Color.Black;
-            };
-            cmbSource.DropDownClosed += (_, __) =>
-            {
-                // After dropdown closes, set color based on selected item
-                if (cmbSource.SelectedIndex == 0)
-                {
-                    var item = cmbSource.Items[0]?.ToString();
-                    if (item == "Select source folder...")
-                        cmbSource.ForeColor = Color.FromArgb(150, 150, 150);
-                    else
-                        cmbSource.ForeColor = Color.Black;
-                }
-                else
-                {
-                    cmbSource.ForeColor = Color.Black;
-                }
-            };
-            cmbSource.SelectedIndexChanged += (_, __) =>
-            {
-                if (cmbSource.SelectedIndex == 1)  // "Browse..." clicked
-                {
-                    PickSource();
-                    if (!string.IsNullOrEmpty(selectedSourcePath))
-                    {
-                        // Valid path selected
-                        if (cmbSource.Items.Count == 2)  // Only placeholder and Browse
-                            cmbSource.Items.Insert(0, selectedSourcePath);
-                        else
-                            cmbSource.Items[0] = selectedSourcePath;
-                        cmbSource.SelectedIndex = 0;
-                        cmbSource.ForeColor = Color.Black;
-                    }
-                    else
-                    {
-                        // Cancelled or no selection - go back to placeholder
-                        cmbSource.SelectedIndex = 0;
-                        cmbSource.ForeColor = Color.FromArgb(150, 150, 150);
-                    }
-                }
-            };
-            settings.Controls.Add(cmbSource, 1, 0);
-            // Force gray color for placeholder after adding to form
-            cmbSource.ForeColor = Color.FromArgb(150, 150, 150);
-
-            btnOpenLog = new Button 
-            { 
-                Text = "Log", 
-                Dock = DockStyle.Fill,
-                BackColor = Color.FromArgb(100, 100, 100),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 11f, FontStyle.Bold),
-                TabIndex = 2
-            };
-            btnOpenLog.FlatAppearance.BorderSize = 0;
-            btnOpenLog.Click += (_, __) => { SafeLog("[UI] Log button clicked"); OpenLog(); };
-            settings.Controls.Add(btnOpenLog, 2, 0);
-
-            btnRefresh = new Button 
-            { 
-                Text = "Refresh", 
-                Dock = DockStyle.Fill,
-                BackColor = Color.FromArgb(70, 130, 180),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 11f, FontStyle.Bold),
-                TabIndex = 3
-            };
-            btnRefresh.FlatAppearance.BorderSize = 0;
-            btnRefresh.Click += (_, __) => { SafeLog("[UI] Refresh button clicked"); PopulateDrives(); };
-            settings.Controls.Add(btnRefresh, 3, 0);
-
-            // Destination
-            settings.Controls.Add(MakeLeft("Destination"), 0, 1);
-            cmbDest = new ComboBox 
-            { 
-                Dock = DockStyle.Fill, 
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.White,
-                ForeColor = Color.FromArgb(150, 150, 150),
-                TabIndex = 4,
-                Font = new Font("Segoe UI", 10f)
-            };
-            cmbDest.Tag = "Select a destination drive...";
-            cmbDest.DropDown += (_, __) =>
-            {
-                // When dropdown opens, set to black so all items are readable
-                cmbDest.ForeColor = Color.Black;
-            };
-            cmbDest.DropDownClosed += (_, __) =>
-            {
-                // After dropdown closes, set color based on selected item
-                if (cmbDest.SelectedIndex == 0)
-                    cmbDest.ForeColor = Color.FromArgb(150, 150, 150);
-                else
-                    cmbDest.ForeColor = Color.Black;
-            };
-            settings.Controls.Add(cmbDest, 1, 1);
-            // Force gray color for placeholder after adding to form
-            cmbDest.ForeColor = Color.FromArgb(150, 150, 150);
-
-            settings.Controls.Add(new Label { Text = "", Dock = DockStyle.Fill }, 2, 1);
-            settings.Controls.Add(new Label { Text = "", Dock = DockStyle.Fill }, 3, 1);
-
-            // Filesystem
-            settings.Controls.Add(MakeLeft("Filesystem"), 0, 2);
-            cmbFs = new ComboBox
-            {
-                Dock = DockStyle.Fill,
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.White,
-                ForeColor = Color.Black,
-                TabIndex = 5,
-                Font = new Font("Segoe UI", 10f)
-            };
-            cmbFs.Items.AddRange(new object[] { "exFAT", "NTFS", "FAT32" });
-            cmbFs.SelectedIndex = 0; // default exFAT
-            settings.Controls.Add(cmbFs, 1, 2);
-            settings.Controls.Add(new Label { Text = "", Dock = DockStyle.Fill }, 2, 2);
-            settings.Controls.Add(new Label { Text = "", Dock = DockStyle.Fill }, 3, 2);
-
-            // (fjernet mode-tekst)
-
-            gbSettings.Controls.Add(settings);
-            root.Controls.Add(gbSettings);
-
-            // ===== PROGRESS =====
-            var gbProgress = new GroupBox
-            {
-                Text = "Progress",
-                Dock = DockStyle.Top,
-                Padding = new Padding(12),
-                Height = 120
-            };
-
-            var progress = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
-            progress.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
-            progress.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
-
-            lblCurrentRel = new Label { Text = "Ready.", Dock = DockStyle.Fill, AutoEllipsis = true };
-            bar = new ProgressBar { Dock = DockStyle.Top, Height = 30, Minimum = 0, Maximum = 100 };
-
-            progress.Controls.Add(lblCurrentRel, 0, 0);
-            progress.Controls.Add(bar, 0, 1);
-            gbProgress.Controls.Add(progress);
-            root.Controls.Add(gbProgress);
-
-            root.Controls.Add(new Panel { Height = 20, Dock = DockStyle.Top });
-
-            // ===== STATS =====
-            var gbStats = new GroupBox
-            {
-                Text = "Stats",
-                Dock = DockStyle.Top,
-                Padding = new Padding(16),
-                Height = 260
-            };
-
-            var stats = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 6 };
-            stats.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130));
-            stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            for (int r = 0; r < 6; r++) stats.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-
-            Label Key(string t) => new Label { Text = t, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.FromArgb(70, 70, 70) };
-            Label Val() => new Label { Text = "-", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Font = new Font(Font.FontFamily, 10f, FontStyle.Bold) };
-
-            stats.Controls.Add(Key("Files (%)"), 0, 0); lblOverallFiles = Val(); stats.Controls.Add(lblOverallFiles, 1, 0);
-            stats.Controls.Add(Key("Data (bytes)"), 0, 1); lblOverallBytes = Val(); stats.Controls.Add(lblOverallBytes, 1, 1);
-            stats.Controls.Add(Key("File count"), 0, 2); lblFile = Val(); stats.Controls.Add(lblFile, 1, 2);
-            stats.Controls.Add(Key("This file"), 0, 3); lblCurrentFile = Val(); stats.Controls.Add(lblCurrentFile, 1, 3);
-            stats.Controls.Add(Key("Speed"), 0, 4); lblSpeed = Val(); stats.Controls.Add(lblSpeed, 1, 4);
-            stats.Controls.Add(Key("ETA"), 0, 5); lblEta = Val(); stats.Controls.Add(lblEta, 1, 5);
-
-            gbStats.Controls.Add(stats);
-            root.Controls.Add(gbStats);
-
-            // ===== BUTTONS =====
-            var bottom = new FlowLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.RightToLeft,
-                AutoSize = true,
-                Padding = new Padding(0, 10, 0, 0)
-            };
-
-            btnStart = new Button 
-            { 
-                Text = "START", 
-                Width = 160, 
-                Height = 44,
-                BackColor = Color.FromArgb(0, 150, 0),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 12f, FontStyle.Bold)
-            };
-            btnStart.FlatAppearance.BorderSize = 0;
-            
-            btnCancel = new Button 
-            { 
-                Text = "Cancel", 
-                Width = 160, 
-                Height = 44, 
-                Enabled = false,
-                BackColor = Color.FromArgb(150, 0, 0),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 12f, FontStyle.Bold)
-            };
-            btnCancel.FlatAppearance.BorderSize = 0;
-
-            btnStart.Click += async (_, __) => { SafeLog("[UI] START button clicked"); await StartCopyAsync(); };
-            btnCancel.Click += (_, __) => { SafeLog("[UI] Cancel button clicked"); CancelCopy(); };
-            FormClosing += (_, e) =>
-            {
-                if (_cts != null) { e.Cancel = true; CancelCopy(); }
-            };
-
-            bottom.Controls.Add(btnStart);
-            bottom.Controls.Add(btnCancel);
-            root.Controls.Add(bottom);
-
-            // Status strip
-            status = new StatusStrip();
-            statusLeft = new ToolStripStatusLabel("Ready");
-            statusRight = new ToolStripStatusLabel(DateTime.Now.ToString("HH:mm:ss"));
-            status.Items.Add(statusLeft);
-            status.Items.Add(new ToolStripStatusLabel { Spring = true });
-            status.Items.Add(statusRight);
-            Controls.Add(status);
-
-            var timer = new System.Windows.Forms.Timer { Interval = 1000 };
-            timer.Tick += (_, __) => statusRight.Text = DateTime.Now.ToString("HH:mm:ss");
-            timer.Start();
-        }
-
-        private void SetIdleUi()
-        {
-            statusLeft.Text = "Ready";
-            lblOverallFiles.Text = "-";
-            lblOverallBytes.Text = "-";
-            lblFile.Text = "-";
-            lblCurrentFile.Text = "-";
-            lblSpeed.Text = "-";
-            lblEta.Text = "-";
-            lblCurrentRel.Text = "Ready.";
-            bar.Value = 0;
-        }
-
-        private void SetRunning(bool running)
-        {
-            btnStart.Enabled = !running;
-            cmbSource.Enabled = !running;
-            btnRefresh.Enabled = !running;
-            cmbDest.Enabled = !running;
-            cmbFs.Enabled = !running;
-
-            btnCancel.Enabled = running;
-            statusLeft.Text = running ? "Working..." : "Ready";
-        }
-
-        private void PickSource()
-        {
-            try
-            {
-                using var dlg = new FolderBrowserDialog
-                {
-                    Description = @"Select source folder",
-                    SelectedPath = !string.IsNullOrEmpty(selectedSourcePath) ? selectedSourcePath : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    ShowNewFolderButton = false
-                };
-
-                if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrWhiteSpace(dlg.SelectedPath))
-                {
-                    selectedSourcePath = dlg.SelectedPath;  // Store selected path
-                    SafeLog($"[SOURCE] User selected: {selectedSourcePath}");
-                }
-                else
-                {
-                    SafeLog("[SOURCE] User cancelled source picker");
-                }
-            }
-            catch (Exception ex)
-            {
-                SafeLog($"[SOURCE] PickSource FAILED: {ex.GetType().Name}: {ex.Message}");
-            }
-        }
-
-        private void PopulateDrives()
-        {
-            try
-            {
-                cmbDest.Items.Clear();
-                cmbDest.Items.Add(new DriveItem((string?)cmbDest.Tag ?? "Select a destination drive...", "", ""));
-                SafeLog("[DRIVES] Cleared destination combo, added placeholder");
-
-                var drives = DriveInfo.GetDrives().Where(x => x.IsReady).ToList();
-                SafeLog($"[DRIVES] Found {drives.Count} ready drive(s)");
-
-                foreach (var d in drives)
-                {
-                    try
-                    {
-                        var root = d.RootDirectory.FullName; // "F:\"
-                        var label = string.IsNullOrWhiteSpace(d.VolumeLabel) ? "(no label)" : d.VolumeLabel;
-                        var freeGB = Math.Round(d.AvailableFreeSpace / 1024d / 1024d / 1024d, 1);
-                        var sizeGB = Math.Round(d.TotalSize / 1024d / 1024d / 1024d, 1);
-                        cmbDest.Items.Add(new DriveItem($"{root}  {label}  ({freeGB}/{sizeGB} GB free)", root, label));
-                        SafeLog($"[DRIVES] Added: {root} Label={label} {freeGB}/{sizeGB}GB");
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeLog($"[DRIVES] Failed to add drive: {ex.Message}");
-                    }
-                }
-
-                cmbDest.DisplayMember = nameof(DriveItem.Text);
-                cmbDest.SelectedIndex = 0;
-                cmbDest.ForeColor = Color.FromArgb(150, 150, 150);
-                SafeLog("[DRIVES] PopulateDrives completed");
-            }
-            catch (Exception ex)
-            {
-                SafeLog($"[DRIVES] PopulateDrives FAILED: {ex.GetType().Name}: {ex.Message}");
-            }
-        }
-
-        private void OpenLog()
-        {
-            try
-            {
-                SafeLog("[UI] Opening log file");
-                if (File.Exists(_logPath))
-                {
-                    Process.Start(new ProcessStartInfo("notepad.exe", $"\"{_logPath}\"") { UseShellExecute = true });
-                    SafeLog("[UI] Log opened in notepad");
-                }
-                else
-                {
-                    SafeLog($"[UI] Log file not found: {_logPath}");
-                    MessageBox.Show("Log findes ikke endnu:\n" + _logPath);
-                }
-            }
-            catch (Exception ex)
-            {
-                SafeLog($"[UI] OpenLog FAILED: {ex.GetType().Name}: {ex.Message}");
-                MessageBox.Show(ex.Message);
-            }
-        }
-
-        private void CancelCopy()
-        {
-            try { _cts?.Cancel(); } catch { }
-            btnCancel.Enabled = false;
-            SafeLog("[UI] Cancellation requested; waiting for worker to stop");
-            statusLeft.Text = "Cancelled";
-        }
-
-        private async Task StartCopyAsync()
-        {
-            // Get source from selectedSourcePath
-            string src = selectedSourcePath?.Trim() ?? "";
-            
-            SafeLog($"[START] Copy initiated - Source: {src}");
-
-            if (string.IsNullOrWhiteSpace(src) || !Directory.Exists(src))
-            {
-                MessageBox.Show(@"Source folder not found.
-
-Please select a valid source folder by clicking on the dropdown.");
-                SafeLog("[ERROR] Source folder not found or invalid");
-                return;
-            }
-
-            if (cmbDest.SelectedItem is not DriveItem di || string.IsNullOrWhiteSpace(di.Root) || !Directory.Exists(di.Root))
-            {
-                MessageBox.Show("Vælg et gyldigt destination-drev.");
-                SafeLog("[ERROR] Destination drive not selected or invalid");
-                return;
-            }
-            
-            SafeLog($"[START] Destination selected: {di.Root} ({di.Label})");
-
-            FileInfo[] files;
-            long totalBytes;
-            FormatSafety.Target target;
-            string copyRoot;
-            string fileSystem = cmbFs.SelectedItem?.ToString() ?? "";
-            try
-            {
-                FormatSafety.CheckSource(src, di.Root);
-                files = FormatSafety.Scan(src)
-                    .Where(f => !ExcludeNames.Contains(f.Name, StringComparer.OrdinalIgnoreCase))
-                    .OrderByDescending(f => IsBig(f.Extension)).ThenByDescending(f => f.Length).ToArray();
-                target = FormatSafety.Inspect(di.Root, src);
-                FormatSafety.CheckFiles(files, target.Size, fileSystem);
-                totalBytes = files.Sum(f => f.Length);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Preflight failed; nothing was erased.\n" + ex.Message);
-                return;
-            }
-            // Confirm + format
-            var destLetter = di.Root.Trim().TrimEnd('\\').TrimEnd(':'); // "F"
-            using (var dlg = new ConfirmFormatDialog(di.Root, target.Label, target.Size))
-            {
-                if (dlg.ShowDialog(this) != DialogResult.OK)
-                    return;
-            }
-
-            try
-            {
-                SetRunning(true);
-                statusLeft.Text = "Formatting drive...";
-                lblCurrentRel.Text = $"Formatting {di.Root} ...";
-                bar.Value = 0;
-                SafeLog($"FORMAT START: {di.Root} Label={target.Label}");
-                SafeLog($"[FORMAT] Validated volume: {target.VolumePath}, disk: {target.DiskId}");
-
-                // Recheck after confirmation and again inside the elevated process.
-                FormatSafety.CheckSource(src, di.Root);
-                var currentFiles = FormatSafety.Scan(src)
-                    .Where(f => !ExcludeNames.Contains(f.Name, StringComparer.OrdinalIgnoreCase))
-                    .OrderByDescending(f => IsBig(f.Extension)).ThenByDescending(f => f.Length).ToArray();
-                if (!files.Select(f => (f.FullName, f.Length)).SequenceEqual(
-                    currentFiles.Select(f => (f.FullName, f.Length))))
-                    throw new InvalidOperationException("Source changed; start again.");
-                FormatSafety.CheckFiles(files, target.Size, fileSystem);
-                FormatSafety.Format(di.Root, src, target, fileSystem);
-                // Revalidate the formatted target, then abandon the drive letter for all writes.
-                copyRoot = FormatSafety.CopyRoot(target, FormatSafety.Inspect(di.Root, src));
-                SafeLog("FORMAT DONE");
-                PopulateDrives();
-                ReselectDrive(destLetter);
-
-                // No recursive deletion: a failed format must never trigger cleanup.
-            }
-            catch (Exception ex)
-            {
-                SetRunning(false);
-                SafeLog($"FORMAT FAILED: {ex.GetType().Name}: {ex.Message}");
-                SafeLog($"STACK TRACE: {ex.StackTrace}");
-                MessageBox.Show("Format fejl:\n" + ex.Message + "\n\nSe log: " + _logPath);
-                statusLeft.Text = "Format failed";
-                return;
-            }
-
-            // Reset progress
-            _cts = new CancellationTokenSource();
-            _emaBps = 0;
-            _lastOverallBytes = 0;
-            _tick.Restart();
-
-            bar.Value = 0;
-            lblCurrentRel.Text = "Starting...";
-            lblOverallFiles.Text = $"0% (0 / {files.Length})";
-            lblOverallBytes.Text = $"0% (0 / {FormatBytes(totalBytes)})";
-            lblFile.Text = $"0 / {files.Length}";
-            lblCurrentFile.Text = "-";
-            lblSpeed.Text = "-";
-            lblEta.Text = "-";
-            statusLeft.Text = "Working...";
-
-            btnCancel.Enabled = true;
-
-            try
-            {
-                await Task.Run(() => CopySequentialWithProgress(src, copyRoot, files, totalBytes, _cts.Token));
-
-                BeginInvoke(new Action(() =>
-                {
-                    bar.Value = 100;
-                    lblCurrentRel.Text = "Done âœ…";
-                    lblOverallFiles.Text = $"100% ({files.Length} / {files.Length})";
-                    lblOverallBytes.Text = $"100% ({FormatBytes(totalBytes)} / {FormatBytes(totalBytes)})";
-                    lblFile.Text = $"{files.Length} / {files.Length}";
-                    lblCurrentFile.Text = "100%";
-                    lblEta.Text = "00:00:00";
-                    statusLeft.Text = "Done âœ…";
-                }));
-            }
-            catch (OperationCanceledException)
-            {
-                BeginInvoke(new Action(() =>
-                {
-                    statusLeft.Text = "Cancelled";
-                    lblCurrentRel.Text = "Cancelled";
-                }));
-            }
-            catch (Exception ex)
-            {
-                SafeLog($"[COPY] FAILED: {ex.GetType().Name}: {ex.Message}");
-                SafeLog($"[COPY] STACK: {ex.StackTrace}");
-                BeginInvoke(new Action(() =>
-                {
-                    statusLeft.Text = "Error";
-                    MessageBox.Show("Fejl:\n" + ex.Message + "\n\nSe log: " + _logPath);
-                }));
-            }
-            finally
-            {
-                _cts?.Dispose();
-                _cts = null;
-                SetRunning(false);
-            }
-        }
-
-        private void ReselectDrive(string destLetter)
-        {
-            destLetter = destLetter.Trim().TrimEnd(':').ToUpperInvariant();
-            for (int i = 0; i < cmbDest.Items.Count; i++)
-            {
-                if (cmbDest.Items[i] is DriveItem item)
-                {
-                    var letter = item.Root.Trim().TrimEnd('\\').TrimEnd(':').ToUpperInvariant();
-                    if (letter == destLetter)
-                    {
-                        cmbDest.SelectedIndex = i;
-                        break;
-                    }
-                }
-            }
-        }
-
-        private void CopySequentialWithProgress(string srcRoot, string destRoot, FileInfo[] files, long totalBytes, CancellationToken token)
-        {
-            FormatSafety.ValidateVolumePath(destRoot);
-            long doneBytes = 0;
-
-            // Pre-create dirs
-            try
-            {
-                var dirs = Directory.EnumerateDirectories(srcRoot, "*", SearchOption.AllDirectories).ToList();
-                SafeLog($"[COPY] Pre-creating {dirs.Count} directories");
-                foreach (var dir in dirs)
-                {
-                    token.ThrowIfCancellationRequested();
-                    var relDir = Path.GetRelativePath(srcRoot, dir);
-                    var destDir = Path.Combine(destRoot, relDir);
-                    Directory.CreateDirectory(destDir);
-                }
-                SafeLog($"[COPY] Directories created successfully");
-            }
-            catch (Exception ex)
-            {
-                SafeLog($"[COPY] Pre-create directories FAILED: {ex.GetType().Name}: {ex.Message}");
-                throw;
-            }
-
-            const int bufSize = 1024 * 1024; // 1MB
-            var buffer = new byte[bufSize];
-
-            for (int i = 0; i < files.Length; i++)
-            {
-                token.ThrowIfCancellationRequested();
-
-                var f = files[i];
-                var rel = Path.GetRelativePath(srcRoot, f.FullName).Replace('/', '\\');
-                var dst = Path.Combine(destRoot, rel);
-                Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-
-                long curCopied = 0;
-                long curTotal = f.Length;
-
-                BeginInvoke(new Action(() =>
-                {
-                    lblCurrentRel.Text = rel;
-                    lblFile.Text = $"{i + 1} / {files.Length}";
-                    lblCurrentFile.Text = $"0% (0 / {FormatBytes(curTotal)})";
-                }));
-
-                using var src = new FileStream(f.FullName, FileMode.Open, FileAccess.Read, FileShare.Read,
-                    bufSize, FileOptions.SequentialScan);
-
-                using var dstFs = new FileStream(dst, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                    bufSize, FileOptions.SequentialScan);
-
-                int read;
-                var lastUi = Stopwatch.StartNew();
-
-                while ((read = src.Read(buffer, 0, buffer.Length)) > 0)
-                {
-                    token.ThrowIfCancellationRequested();
-
-                    dstFs.Write(buffer, 0, read);
-                    curCopied += read;
-
-                    // UI update ~4x/sek
-                    if (lastUi.ElapsedMilliseconds >= 250)
-                    {
-                        lastUi.Restart();
-
-                        long overallDone = doneBytes + curCopied;
-
-                        // FILE-based percent (what you want as â€œ2%â€)
-                        var filesPct = (int)Math.Round(((i + (curTotal > 0 ? (curCopied / (double)curTotal) : 0)) / files.Length) * 100.0);
-                        filesPct = Math.Clamp(filesPct, 0, 100);
-
-                        // BYTES-based percent (real data)
-                        var bytesPct = totalBytes > 0 ? (int)Math.Round(overallDone * 100.0 / totalBytes) : 0;
-                        bytesPct = Math.Clamp(bytesPct, 0, 100);
-
-                        // speed/eta
-                        var dt = Math.Max(0.001, _tick.Elapsed.TotalSeconds);
-                        _tick.Restart();
-
-                        var delta = Math.Max(0, overallDone - _lastOverallBytes);
-                        _lastOverallBytes = overallDone;
-
-                        var instBps = delta / dt;
-                        const double alpha = 0.20;
-                        _emaBps = _emaBps <= 0 ? instBps : (alpha * instBps) + ((1 - alpha) * _emaBps);
-
-                        var remain = Math.Max(0, totalBytes - overallDone);
-                        TimeSpan? eta = null;
-                        if (_emaBps >= 1024)
-                        {
-                            var seconds = remain / _emaBps;
-                            seconds = Math.Min(seconds, TimeSpan.MaxValue.TotalSeconds - 1);
-                            eta = TimeSpan.FromSeconds(seconds);
-                        }
-
-                        var curPct = curTotal > 0 ? (int)Math.Round(curCopied * 100.0 / curTotal) : 0;
-                        curPct = Math.Clamp(curPct, 0, 100);
-
-                        BeginInvoke(new Action(() =>
-                        {
-                            // Progress bar shows FILE-based percent (so first file ~2-4% instead of 17%)
-                            bar.Value = filesPct;
-
-                            lblOverallFiles.Text = $"{filesPct}% ({i + 1} / {files.Length})";
-                            lblOverallBytes.Text = $"{bytesPct}% ({FormatBytes(overallDone)} / {FormatBytes(totalBytes)})";
-
-                            lblCurrentFile.Text = $"{curPct}% ({FormatBytes(curCopied)} / {FormatBytes(curTotal)})";
-                            lblSpeed.Text = _emaBps > 0 ? $"{FormatBytes((long)_emaBps)}/s" : "-";
-                            lblEta.Text = eta.HasValue ? eta.Value.ToString(@"hh\:mm\:ss") : "-";
-                        }));
-                    }
-                }
-
-                dstFs.Flush(true);
-                doneBytes += curTotal;
-
-                SafeLog($"[COPY] OK: {rel} ({curTotal} bytes)");
-            }
-        }
-
-        private void SafeLog(string line)
-        {
-            try 
-            { 
-                File.AppendAllText(_logPath, line + Environment.NewLine); 
-            } 
-            catch (Exception ex) 
-            { 
-                // If log write fails, at least try to alert via Debug
-                System.Diagnostics.Debug.WriteLine($"[LOG_FAIL] Could not write to log: {ex.Message}");
-            }
-        }
-
-        private static bool IsBig(string ext)
-        {
-            ext = (ext ?? "").ToLowerInvariant();
-            return ext is ".iso" or ".img" or ".vhd" or ".vhdx";
-        }
-
-        private static string FormatBytes(long bytes)
-        {
-            double b = bytes;
-            string[] suf = { "B", "KB", "MB", "GB", "TB" };
-            int i = 0;
-            while (b >= 1024 && i < suf.Length - 1) { b /= 1024; i++; }
-            return $"{b:0.0} {suf[i]}";
-        }
-
-        private readonly record struct DriveItem(string Text, string Root, string Label);
-
-        private sealed class ConfirmFormatDialog : Form
-        {
-            public ConfirmFormatDialog(string drive, string label, long size = 0)
-            {
-                Text = "Confirm FORMAT";
-                StartPosition = FormStartPosition.CenterParent;
-                FormBorderStyle = FormBorderStyle.FixedDialog;
-                MaximizeBox = false;
-                MinimizeBox = false;
-                Width = 600;
-                Height = 440;
-
-                var wrap = new TableLayoutPanel
-                {
-                    Dock = DockStyle.Fill,
-                    Padding = new Padding(18),
-                    ColumnCount = 2,
-                    RowCount = 2
-                };
-                wrap.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 64));
-                wrap.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-                wrap.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-                wrap.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
-                Controls.Add(wrap);
-
-                var icon = new Label
-                {
-                    Text = "!",
-                    Dock = DockStyle.Fill,
-                    Font = new Font("Segoe UI", 40f, FontStyle.Bold),
-                    ForeColor = Color.FromArgb(180, 20, 20),
-                    TextAlign = ContentAlignment.TopCenter
-                };
-
-                var text = new Label
-                {
-                    Dock = DockStyle.Fill,
-                    AutoSize = false,
-                    TextAlign = ContentAlignment.TopLeft
-                };
-                text.Font = new Font("Segoe UI", 11f, FontStyle.Regular);
-                text.Text =
-                    "This will DELETE ALL data on the destination drive.\n" +
-                    "This action CANNOT be undone.\n\n" +
-                    $"Drive: {drive}\n" +
-                    $"Label: {label}\n" +
-                    (size > 0 ? $"Size: {FormatBytes(size)}" : "");
-
-                // Make "ADVARSEL" stand out by coloring the first line via simple trick:
-                // (we keep it simple: bold + red in a separate label)
-                var danger = new Label
-                {
-                    Text = "WARNING",
-                    Dock = DockStyle.Top,
-                    ForeColor = Color.FromArgb(180, 20, 20),
-                    Font = new Font("Segoe UI", 16f, FontStyle.Bold),
-                    Height = 44,
-                    TextAlign = ContentAlignment.MiddleLeft
-                };
-
-                var textPanel = new Panel { Dock = DockStyle.Fill };
-                textPanel.Controls.Add(text);
-                textPanel.Controls.Add(danger);
-
-                // push body text down a bit
-                text.Padding = new Padding(0, 8, 0, 0);
-
-                wrap.Controls.Add(icon, 0, 0);
-                wrap.Controls.Add(textPanel, 1, 0);
-
-                var buttons = new FlowLayoutPanel
-                {
-                    Dock = DockStyle.Fill,
-                    FlowDirection = FlowDirection.RightToLeft,
-                    Padding = new Padding(0),
-                    WrapContents = false
-                };
-
-                var btnFormat = new Button
-                {
-                    Text = "FORMAT DISK",
-                    Width = 160,
-                    Height = 38,
-                    BackColor = Color.FromArgb(200, 40, 40),
-                    ForeColor = Color.White,
-                    FlatStyle = FlatStyle.Flat
-                };
-                btnFormat.FlatAppearance.BorderSize = 0;
-                btnFormat.Click += (_, __) => { DialogResult = DialogResult.OK; Close(); };
-
-                var btnCancel = new Button
-                {
-                    Text = "Cancel",
-                    Width = 120,
-                    Height = 36,
-                    DialogResult = DialogResult.Cancel
-                };
-
-                buttons.Controls.Add(btnFormat); // farlig til hÃ¸jre
-                buttons.Controls.Add(btnCancel); // sikker til venstre
-
-                wrap.Controls.Add(buttons, 0, 1);
-                wrap.SetColumnSpan(buttons, 2);
-
-                // Safety: Enter/Esc = Cancel (sÃ¥ man ikke kan "next next")
-                AcceptButton = btnCancel;
-                CancelButton = btnCancel;
-            }
+            Text = "Confirm destination erasure";
+            AutoScaleDimensions = new SizeF(96, 96);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            Font = new Font("Segoe UI", 10);
+            ClientSize = new Size(640, 480); MinimumSize = new Size(540, 460);
+            StartPosition = FormStartPosition.CenterParent; MinimizeBox = MaximizeBox = false;
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), AutoScroll = true, ColumnCount = 1 };
+            Controls.Add(layout);
+            var warning = MakeLabel("All destination data will be permanently erased"); warning.ForeColor = Color.Firebrick; warning.Font = new Font(Font, FontStyle.Bold);
+            Add(layout, warning);
+            Add(layout, MakeLabel($"Drive: {drive}\nLabel: {label}\nSize: {FormatBytes(size)}\n\nThis action cannot be undone. Check your backups before continuing."));
+            Add(layout, preview);
+            var acknowledge = new CheckBox { Text = "I checked this destination and backed up its contents.", AutoSize = true, Margin = new Padding(4, 16, 4, 16) };
+            Add(layout, acknowledge);
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
+            var back = MakeButton("Cancel"); back.DialogResult = DialogResult.Cancel;
+            var erase = MakeButton("FORMAT DISK"); erase.Enabled = false; erase.ForeColor = Color.Firebrick;
+            acknowledge.CheckedChanged += (_, _) => erase.Enabled = acknowledge.Checked;
+            erase.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
+            buttons.Controls.AddRange([back, erase]); Add(layout, buttons);
+            AcceptButton = back; CancelButton = back;
         }
     }
 }
