@@ -47,25 +47,27 @@ dotnet publish ioDDRebuilder/ioDDRebuilder.csproj -c Release -r win-x64 --self-c
 dotnet publish ioDDRebuilder.Formatter/ioDDRebuilder.Formatter.csproj -c Release -r win-x64 --self-contained false -o DIST_ioDDRebuilder_win-x64/formatter
 ```
 
-Run the native icon command above after publishing. Run `./scripts/Build-Candidate.ps1` in PowerShell 7 on Windows for the complete pipeline. The CI workflow calls this same script: it builds both configurations, runs safety tests, mock scenarios and syntax validation, publishes both projects, verifies native icons, and creates a ZIP plus SHA-256 checksum under `artifacts/`. Each ZIP includes `BUILDINFO.json` with the source commit and `MANIFEST.json` with file hashes. The archive is extracted again, its file hashes checked, and both packaged EXE icons rechecked before upload. It does not create a GitHub release. Remote CI validation is pending.
+Run the native icon command above after publishing. Run `./scripts/Build-Candidate.ps1` in PowerShell 7 on Windows for the complete pipeline. The CI workflow calls this same script: it builds both configurations, runs safety tests, mock scenarios and syntax validation, publishes both projects, verifies native icons, and creates a ZIP plus SHA-256 checksum under `artifacts/`. Each ZIP includes `BUILDINFO.json` with the source commit and `MANIFEST.json` with file hashes. The archive is extracted again, its file hashes checked, and both packaged EXE icons rechecked before upload. It does not create a GitHub release. Remote CI validation has passed; see the validation record below and the latest checks on [PR #3](https://github.com/thalf/ioDD-Rebuilder/pull/3/checks). Actions are pinned to reviewed release commit hashes.
 
-If PowerShell script execution is disabled, a process-scoped invocation such as `powershell -NoProfile -ExecutionPolicy Bypass -File tests/Test-StorageGuard.ps1` runs the reviewed local test without changing the machine policy. Windows Application Control is separate; do not disable it to run unsigned builds. Use an approved development machine or CI.
+Run scripts only where the existing Windows security policy permits them. Do not disable or bypass script execution controls or Windows Application Control to run unsigned builds; use an approved development machine or the GitHub-hosted Windows CI runner.
 
-## Local validation results
+## Validation results
 
 - Final GUI Debug and Release builds: passed, zero warnings/errors.
 - Final Formatter Release build and safety-test build: passed, zero warnings/errors.
 - Final win-x64 framework-dependent publish, GUI and Formatter: passed.
 - Native icon test: passed for all five executable paths listed above, six matching frames each.
 - First GUI revision: all 32 pre-existing C# non-destructive safety checks passed. Its screenshots exposed layout issues, which led to wider labels, a larger initial client size and explicit DPI baseline settings.
-- Final expanded C# suite: builds successfully but execution is blocked by Windows Application Control (0x800711C7), even outside the sandbox. The new icon, confirmation-default and checksum tests therefore remain unexecuted locally. The earlier pass is not a final-suite pass.
-- Final shared PowerShell guard templates: syntax parsed successfully; all 16 mocked scenarios passed. Because the final C# runner was blocked, this local fixture was expanded directly from the shared script templates. CI must repeat the tests using the C#-generated fixture.
-- No destructive tests, commits, pushes or releases were performed. Existing screenshots are historical; final UI, multi-monitor DPI and shell behavior are not visually certified here.
+- Final expanded C# suite: **42 non-destructive checks passed in GitHub Actions**, including every ICO frame, confirmation defaults, checksum matching/mismatch/cancellation and existing safety regressions. Local execution remains blocked by Windows Application Control (0x800711C7); it was not disabled or bypassed.
+- PowerShell: syntax parsing and **16 mocked storage scenarios passed in GitHub Actions using the C#-generated fixture**. No actual storage cmdlet was executed by these mocks.
+- GitHub Actions also passed GUI Debug/Release and Formatter Release builds with zero compiler warnings/errors, both win-x64 publishes, all six native icon resource comparisons on five build outputs and two extracted package executables, and ZIP round-trip/manifest validation. The candidate ZIP and SHA-256 checksum uploaded successfully.
+- Recorded passing run: [Windows validation run 43645548061](https://github.com/thalf/ioDD-Rebuilder/actions/runs/43645548061), feature commit `37e8cc70cd0866b2d447e2fe3431437110cae327` (the PR job tests GitHub?s temporary merge commit). The initial CI failure was a test assumption about .NET 8 selection of the zero-encoded 256px ICO frame; tests now isolate and decode every original frame without changing the icon asset.
+- The authorized feature branch and PR are published for review. No destructive tests, security-policy changes, merges, GitHub Releases or Docker Hub updates were performed. Existing screenshots are historical; final UI, multi-monitor DPI, UAC/hardware behavior and shell appearance still need manual acceptance. Passing automation is not full application validation.
 
 ## Windows review and release gate
 
 1. Extract the complete candidate ZIP to a local folder outside any proposed destination. Launch `ioDDRebuilder.exe` directly, without clicking Review rebuild. Confirm version, title bar, Explorer, taskbar and Alt+Tab icons. The folder contains no loose ICO.
-2. Run the entire non-destructive test suite and CI successfully on an approved Windows development machine. Capture updated screenshots with `dotnet run --project tests/SafetyTests.csproj -c Release -- docs/images --screenshots`.
+2. Confirm the latest PR checks are green. The complete non-destructive pipeline already passed on the GitHub-hosted Windows runner; rerun it for any subsequent code change. Capture updated screenshots with `dotnet run --project tests/SafetyTests.csproj -c Release -- docs/images --screenshots`.
 3. Inspect layout, keyboard navigation, resizing, long folder paths and drive labels at 100%, 150% and 200% DPI and when moving between monitors. Review the preview and confirmation without accepting erasure. Confirm Enter/Escape cancel and the format button starts disabled.
 4. Inspect the safety changes independently. Automated tests must continue to use mocks or temporary files, never actual storage formatting.
 5. Only if a maintainer intentionally authorizes a manual hardware acceptance test: use an expendable, fully backed-up USB device with no valuable data. Check UAC refusal, format failure handling, cancellation during copying and verification, checksum mismatch and iODD compatibility. Do not test against an internal, system or source disk.

@@ -13,6 +13,8 @@ Large disk images (`.iso`, `.img`, `.vhd`, `.vhdx`) are copied first, largest fi
 
 ## Version 1.1 preparation
 
+The Windows CI pipeline has passed 42 non-destructive C# checks, 16 mocked storage scenarios, Debug/Release builds, win-x64 publishing, and native icon/archive integrity checks. See [PR #3 and its latest checks](https://github.com/thalf/ioDD-Rebuilder/pull/3). This remains a review candidate: manual Windows UI, UAC, hardware and iODD acceptance checks are still required.
+
 The WinForms UI now provides a source folder picker, drive letter/label/capacity/filesystem details, an asynchronous scan and validation preview, and explicit backup acknowledgment before formatting. Overall progress uses bytes; a separate bar tracks the current file. Average transfer speed, remaining time, operation state, completion summary, log opening/export, and optional read-only SHA-256 verification are included. Controls remain locked until workers stop. Formatting cannot be cancelled; copying and verification can be cancelled between I/O blocks.
 
 The existing images in `docs/images` show the older interface. Fresh UI screenshots and multi-monitor DPI checks must be captured on a Windows machine that permits the updated unsigned executable.
