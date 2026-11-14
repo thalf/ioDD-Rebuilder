@@ -17,10 +17,36 @@ internal static class Tests
     {
         ApplicationConfiguration.Initialize();
         using (var iconStream = typeof(MainForm).Assembly.GetManifestResourceStream("ioDDRebuilder.App.ico") ?? throw new Exception("Missing managed icon"))
-        using (var icon = new Icon(iconStream))
+        using (var data = new MemoryStream())
         {
-            foreach (int size in new[] { 16, 32, 48, 64, 128, 256 })
-            { using var selected = new Icon(icon, size, size); using var bitmap = selected.ToBitmap(); if (bitmap.Width != size) throw new Exception("Invalid icon size"); passed++; }
+            iconStream.CopyTo(data);
+            var bytes = data.ToArray();
+            int[] sizes = [256, 128, 64, 48, 32, 16];
+            if (BitConverter.ToUInt16(bytes, 4) != sizes.Length) throw new Exception("Unexpected icon frame count");
+            for (int i = 0; i < sizes.Length; i++)
+            {
+                int entry = 6 + i * 16;
+                int width = bytes[entry] == 0 ? 256 : bytes[entry];
+                int height = bytes[entry + 1] == 0 ? 256 : bytes[entry + 1];
+                int length = checked((int)BitConverter.ToUInt32(bytes, entry + 8));
+                int offset = checked((int)BitConverter.ToUInt32(bytes, entry + 12));
+                if (width != sizes[i] || height != sizes[i] || offset < 0 || length <= 0 || (long)offset + length > bytes.Length)
+                    throw new Exception($"Invalid ICO entry {i}");
+                // Isolate each original frame: .NET 8 multi-frame selection treats the 256px
+                // directory byte (zero) as zero when finding the closest requested size.
+                var frame = new byte[checked(22 + length)];
+                Array.Copy(bytes, 0, frame, 0, 6);
+                BitConverter.GetBytes((ushort)1).CopyTo(frame, 4);
+                Array.Copy(bytes, entry, frame, 6, 16);
+                BitConverter.GetBytes(22u).CopyTo(frame, 18);
+                Array.Copy(bytes, offset, frame, 22, length);
+                using var stream = new MemoryStream(frame);
+                using var selected = new Icon(stream);
+                using var bitmap = selected.ToBitmap();
+                if (bitmap.Width != width || bitmap.Height != height)
+                    throw new Exception($"ICO frame {i}: expected {width}x{height}, decoded {bitmap.Width}x{bitmap.Height}");
+                passed++;
+            }
         }
         foreach (var bad in new[] { "", "C:", @"C:\folder", @"\\server\share", "é:\\", "F;Remove-Item" })
             Reject(() => FormatSafety.Letter(bad));

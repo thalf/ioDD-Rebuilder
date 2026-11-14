@@ -13,7 +13,7 @@ try {
     Invoke-DotNet build ioDDRebuilder/ioDDRebuilder.csproj -c Debug
     Invoke-DotNet build ioDDRebuilder/ioDDRebuilder.csproj -c Release
     Invoke-DotNet build ioDDRebuilder.Formatter/ioDDRebuilder.Formatter.csproj -c Release
-    Invoke-DotNet run --project tests/SafetyTests.csproj -c Release -- docs/images
+    Invoke-DotNet @('run', '--project', 'tests/SafetyTests.csproj', '-c', 'Release', '--', 'docs/images')
     $parseErrors = $null
     [System.Management.Automation.Language.Parser]::ParseFile(
         "$root/docs/images/format-script-for-parser.ps1", [ref]$null, [ref]$parseErrors) | Out-Null
